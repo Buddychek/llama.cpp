@@ -4582,10 +4582,10 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
             ggml_set_output(out);
             stages = {projection, out};
             ggml_tensor * result = nullptr;
-            for (int kind = 0; kind < 2; ++kind) {
+            for (int kind = 0; kind < 3; ++kind) {
                 if (!(reader_types & (1 << kind))) { continue; }
-                auto * weight = ggml_new_tensor_2d(ctx, kind ? GGML_TYPE_BF16 : GGML_TYPE_F16, n_embd, 129);
-                ggml_set_name(weight, kind ? "reader_bf16" : "reader_f16");
+                auto * weight = ggml_new_tensor_2d(ctx, kind == 2 ? GGML_TYPE_Q8_0 : kind ? GGML_TYPE_BF16 : GGML_TYPE_F16, n_embd, 129);
+                ggml_set_name(weight, kind == 2 ? "reader_q8" : kind ? "reader_bf16" : "reader_f16");
                 auto * reader = ggml_mul_mat(ctx, weight, out);
                 ggml_set_output(reader);
                 stages.push_back(reader);
@@ -9579,6 +9579,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 1, true, type, false, false, false, 320));
     }
     test_cases.emplace_back(new test_dsv4_hc_pre(1281, 3, 1, true, GGML_TYPE_F16, false, false, false, 264));
+    for (int readers : {4, 7}) {
+        test_cases.emplace_back(new test_dsv4_hc_pre(512, 3, 2, true, GGML_TYPE_F16, false, false, false, 62, readers));
+        test_cases.emplace_back(new test_dsv4_hc_pre(288, 3, 3, true, GGML_TYPE_F16, false, false, false, 62, readers));
+        test_cases.emplace_back(new test_dsv4_hc_pre(128, 33, 2, true, GGML_TYPE_F16, false, false, false, 318, readers));
+        test_cases.emplace_back(new test_dsv4_hc_pre(512, 1, 8, true, GGML_TYPE_F16, false, false, false, 62, readers));
+    }
     for (int readers : {1, 2, 3}) {
         test_cases.emplace_back(new test_dsv4_hc_pre(2047, 4, 1, true, GGML_TYPE_F16, false, false, false, 64, readers));
         test_cases.emplace_back(new test_dsv4_hc_pre(2047, 6, 1, true, GGML_TYPE_BF16, false, false, false, 64, readers));

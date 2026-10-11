@@ -17,4 +17,10 @@ void ggml_cuda_op_dsv4_hc_pre_emit(ggml_backend_cuda_context & ctx, ggml_tensor 
 
 void ggml_cuda_op_dsv4_hc_pre_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * image, int64_t cols, int64_t padded, const ggml_cuda_hc_pre_emit_data & images);
 
-void ggml_cuda_op_dsv4_hc_pre_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * weights, ggml_tensor * mm, ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data * images = nullptr);
+struct ggml_cuda_hc_pre_q8_emit_data {
+    void * data;
+    int64_t cols;
+    int64_t padded;
+};
+
+void ggml_cuda_op_dsv4_hc_pre_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * weights, ggml_tensor * mm, ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data * images = nullptr, const ggml_cuda_hc_pre_q8_emit_data * q8 = nullptr);

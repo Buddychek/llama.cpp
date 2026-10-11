@@ -283,6 +283,18 @@ static __global__ void dsv4_hc_pre_convert_images(
             sx0, sx1, sx2, sw0, sw1, sw2, sd0, sd1, scale, ggml_cuda_hc_pre_image_store{images, n_embd});
 }
 
+template <typename T, bool Typed>
+static __global__ void dsv4_hc_pre_convert_q8(
+        const float * x, const void * weights, float * raw, float * dst,
+        int64_t n_embd, int64_t hc, int64_t n_tokens,
+        int64_t sx0, int64_t sx1, int64_t sx2,
+        int64_t sw0, int64_t sw1, int64_t sw2,
+        int64_t sd0, int64_t sd1, float scale, ggml_cuda_hc_pre_q8_store<Typed> write) {
+    dsv4_hc_pre_impl<true>(
+            x, ggml_cuda_hc_gate_convert<T>{(const T *) weights, raw}, dst, n_embd, hc, n_tokens,
+            sx0, sx1, sx2, sw0, sw1, sw2, sd0, sd1, scale, write);
+}
+
 template <bool has_comb>
 static __global__ void dsv4_hc_post_f32(
         const float * x,
@@ -443,7 +455,7 @@ void ggml_cuda_op_dsv4_hc_pre_q8(ggml_backend_cuda_context & ctx, ggml_tensor * 
     else { ggml_cuda_hc_pre_q8_launch<false>(ctx, dst, image, cols, padded, images); }
 }
 
-void ggml_cuda_op_dsv4_hc_pre_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * weights, ggml_tensor * mm, ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data * images) {
+void ggml_cuda_op_dsv4_hc_pre_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * weights, ggml_tensor * mm, ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data * images, const ggml_cuda_hc_pre_q8_emit_data * q8) {
     const ggml_tensor * x = dst->src[0];
     const ggml_tensor * view = dst->src[1];
     GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_BF16);
@@ -456,7 +468,19 @@ void ggml_cuda_op_dsv4_hc_pre_convert(ggml_backend_cuda_context & ctx, ggml_type
     const ggml_cuda_kernel_launch_params params(grid_dims, block_dims, 0, ctx.stream());
     const auto launch = [&](auto tag) {
         using T = decltype(tag);
-        if (images) {
+        if (q8) {
+            const auto emit = [&](auto typed) {
+                constexpr bool Typed = decltype(typed)::value;
+                ggml_cuda_kernel_launch(dsv4_hc_pre_convert_q8<T, Typed>, params,
+                    (const float *) x->data, weights, (float *) mm->data, (float *) dst->data,
+                    x->ne[0], x->ne[1], x->ne[2],
+                    x->nb[0]/sizeof(float), x->nb[1]/sizeof(float), x->nb[2]/sizeof(float),
+                    view->nb[0]/sizeof(float), view->nb[1]/sizeof(float), view->nb[2]/sizeof(float),
+                    dst->nb[0]/sizeof(float), dst->nb[1]/sizeof(float), ggml_get_op_params_f32(dst, 0),
+                    ggml_cuda_hc_pre_q8_store<Typed>{(block_q8_1 *) q8->data, q8->cols, q8->padded, images ? *images : ggml_cuda_hc_pre_emit_data{}});
+            };
+            if (images) { emit(std::true_type{}); } else { emit(std::false_type{}); }
+        } else if (images) {
             ggml_cuda_kernel_launch(dsv4_hc_pre_convert_images<T>, params,
                     (const float *) x->data, weights, (float *) mm->data, (float *) dst->data,
                     x->ne[0], x->ne[1], x->ne[2],
