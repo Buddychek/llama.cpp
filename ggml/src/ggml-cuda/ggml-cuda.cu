@@ -4366,8 +4366,13 @@ static std::vector<ggml_cuda_norm_mmq_match> ggml_cuda_plan_norm_mmq(ggml_cgraph
                 grid *= count;
             }
         }
-        if (match.norm && !match.post && match.image >= 0 && small_grid &&
-                (q8_emits.empty() || !q8_emits[i].norm) && (norm_emits.empty() || !norm_emits[i].norm)) {
+        const auto * typed = !norm_emits.empty() && norm_emits[i].norm ? &norm_emits[i] : nullptr;
+        const bool compatible_typed = !typed || (match.post && typed->post == match.post &&
+            typed->norm == match.norm && typed->dst == match.dst && typed->last == match.last);
+        const int block = match.norm && match.norm->ne[0] < 1024 ? 256 : 1024;
+        const bool bounded_post = !match.post || match.norm->ne[0] <= 6*block;
+        if (match.norm && match.image >= 0 && small_grid && bounded_post && compatible_typed &&
+                (q8_emits.empty() || !q8_emits[i].norm)) {
             const auto & primary = reuse.groups[match.image];
             const ggml_tensor * shape = graph->nodes[primary.node]->src[1];
             const int primary_key = keys[primary.node];
@@ -5766,8 +5771,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         };
                         void * f16 = typed ? image(typed->f16) : nullptr;
                         void * bf16 = typed ? image(typed->bf16) : nullptr;
-                        ggml_cuda_op_hc_post_norm_emit_mmq(*cuda_ctx, emit.post, emit.norm, emit.mul, emit.scale, f16, bf16,
-                            mmq_inputs[g].quantized.get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), input->ne[1], mmq_keys[reader]);
+                        void * images[3] = {};
+                        int count = 0;
+                        for (int layout = 0; layout < 3; ++layout) {
+                            const int group = emit.images[layout];
+                            if (group < 0) { continue; }
+                            if (group != g) { mmq_inputs[group].quantized.alloc(mmq_reuse.groups[group].size); }
+                            images[layout] = mmq_inputs[group].quantized.get();
+                            ++count;
+                        }
+                        if (count > 1) {
+                            ggml_cuda_op_hc_post_norm_emit_mmq_multi(*cuda_ctx, emit.post, emit.norm, emit.mul, emit.scale,
+                                f16, bf16, images, input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), input->ne[1]);
+                        } else {
+                            ggml_cuda_op_hc_post_norm_emit_mmq(*cuda_ctx, emit.post, emit.norm, emit.mul, emit.scale, f16, bf16,
+                                mmq_inputs[g].quantized.get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), input->ne[1], mmq_keys[reader]);
+                        }
                         i = emit.last;
                         continue;
                     }
