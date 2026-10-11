@@ -4440,6 +4440,7 @@ static std::vector<ggml_cuda_norm_q8_match> ggml_cuda_plan_norm_q8(ggml_cgraph *
 }
 
 struct ggml_cuda_norm_mmq_match {
+    ggml_tensor * hc_pre = nullptr;
     ggml_tensor * post = nullptr;
     ggml_tensor * norm = nullptr;
     ggml_tensor * mul = nullptr;
@@ -4451,6 +4452,12 @@ struct ggml_cuda_norm_mmq_match {
 };
 
 static ggml_cuda_norm_mmq_match ggml_cuda_match_norm_mmq(ggml_cgraph * graph, int i, int device) {
+    const auto & info = ggml_cuda_info().devices[device];
+    if (GGML_CUDA_CC_IS_NVIDIA(info.cc) && info.warp_size == 32 && ggml_cuda_hc_pre_emit_ok(graph->nodes[i], device) && graph->nodes[i]->ne[0]%QK8_1 == 0 && graph->nodes[i]->ne[1] <= 65535) {
+        ggml_cuda_norm_mmq_match match;
+        match.hc_pre = match.dst = graph->nodes[i]; match.last = i;
+        return match;
+    }
     if (graph->nodes[i]->op == GGML_OP_DSV4_HC_POST) {
         const auto match = ggml_cuda_match_norm_emit(graph, i, device);
         if (!match.post || match.norm->ne[0] % QK8_1) { return {}; }
@@ -4500,7 +4507,7 @@ static ggml_cuda_norm_mmq_match ggml_cuda_match_norm_mmq(ggml_cgraph * graph, in
 }
 
 static std::vector<ggml_cuda_norm_mmq_match> ggml_cuda_plan_norm_mmq(ggml_cgraph * graph, int device,
-        const std::vector<int> & keys, const std::vector<size_t> & sizes, ggml_cuda_reuse_plan & reuse) {
+        const std::vector<int> & keys, const std::vector<size_t> & sizes, ggml_cuda_reuse_plan & reuse, const std::unordered_map<const ggml_tensor *, int> & hc_up, const std::vector<ggml_cuda_norm_q8_match> & q8_emits) {
     std::unordered_map<const ggml_tensor *, std::vector<int>> readers;
     for (int i = 0; i < graph->n_nodes; ++i) {
         if (keys[i] < 0) { continue; }
@@ -4513,15 +4520,17 @@ static std::vector<ggml_cuda_norm_mmq_match> ggml_cuda_plan_norm_mmq(ggml_cgraph
     std::vector<bool> removed(reuse.groups.size(), false);
     for (int i = 0; i < graph->n_nodes; ++i) {
         auto match = ggml_cuda_match_norm_mmq(graph, i, device);
-        if (!match.norm) { continue; }
+        if (!match.norm && !match.hc_pre) { continue; }
+        if (match.hc_pre && (hc_up.count(match.hc_pre) || (!q8_emits.empty() && q8_emits[i].hc_pre))) { continue; }
         const auto norm_group_invalid = [&](int node) {
             const int group = keys[node] == int(MMQ_Q8_1_DS_LAYOUT_D2S6) ? 64 : 32;
-            return match.norm->ne[0] % group || graph->nodes[node]->src[1]->ne[0] % group;
+            return (match.norm ? match.norm : match.dst)->ne[0] % group || graph->nodes[node]->src[1]->ne[0] % group;
         };
         const auto can_emit = [&](int node, int prepare) {
             const ggml_tensor * input = graph->nodes[node]->src[1];
             const ggml_tensor * root = input->view_src ? input->view_src : input;
             uintptr_t begin, end;
+            if (match.hc_pre && (keys[node] > 2 || input->ne[0] != match.dst->ne[0] || input->ne[1] != match.dst->ne[1] || input->ne[2] != 1 || input->ne[3] != 1)) { return false; }
             if (keys[node] < 0 || keys[node] > 3 ||
                     norm_group_invalid(node) || prepare <= match.last || root != match.dst || !ggml_is_contiguous(input) || input->data != match.dst->data ||
                     input->type != GGML_TYPE_F32 || input->ne[0] % QK8_1 || ggml_nbytes(input) != ggml_nbytes(match.dst) ||
@@ -7224,7 +7233,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_reuse_plan mmq_reuse(cgraph, stream_ctx, mmq_keys, mmq_sizes, ggml_cuda_mmq_input_overwritten);
             std::vector<ggml_cuda_norm_mmq_match> mmq_emits;
             if (!disable_reuse && stream_ctx.concurrent_events.empty()) {
-                mmq_emits = ggml_cuda_plan_norm_mmq(cgraph, cuda_ctx->device, mmq_keys, mmq_sizes, mmq_reuse);
+                mmq_emits = ggml_cuda_plan_norm_mmq(cgraph, cuda_ctx->device, mmq_keys, mmq_sizes, mmq_reuse, hc_up, q8_emits);
             }
             ggml_cuda_reuse_inputs<ggml_cuda_mmq_input> mmq_inputs(cuda_ctx->pool(), mmq_reuse);
             const auto prepare_mmq_group = [&](int group) {
@@ -7476,6 +7485,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     const ggml_tensor * input = cgraph->nodes[q8_reuse.groups[g].node]->src[1];
                     q8_inputs[g].alloc(mmvq_sizes[q8_reuse.groups[g].node]);
                     ggml_cuda_op_dsv4_hc_pre_q8(*cuda_ctx, node, q8_inputs[g].get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), images);
+                    continue;
+                }
+                if (!mmq_emits.empty() && mmq_emits[i].hc_pre) {
+                    const auto & emit = mmq_emits[i];
+                    const int g = emit.image, reader = mmq_reuse.groups[g].node;
+                    mmq_inputs[g].quantized.alloc(mmq_reuse.groups[g].size);
+                    ggml_cuda_hc_pre_emit_data images;
+                    if (!norm_emits.empty() && norm_emits[i].hc_pre) {
+                        const auto image = [&](int group) -> void * {
+                            if (group < 0) { return nullptr; }
+                            shared_inputs[group].alloc(input_sizes[reuse.groups[group].node]);
+                            return shared_inputs[group].get();
+                        };
+                        images.f16 = image(norm_emits[i].f16); images.bf16 = image(norm_emits[i].bf16);
+                    }
+                    ggml_cuda_op_dsv4_hc_pre_mmq(*cuda_ctx, node, mmq_inputs[g].quantized.get(),
+                        GGML_PAD(node->ne[0], MATRIX_ROW_PADDING), mmq_keys[reader], images);
                     continue;
                 }
                 if (!norm_emits.empty() && norm_emits[i].hc_pre) {

@@ -4491,6 +4491,7 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     const bool swap_add;
     const int64_t projection_rank;
     const int reader_types;
+    const ggml_type consumer_type;
     std::vector<ggml_tensor *> stages;
     ggml_tensor * projection = nullptr;
     ggml_tensor * projection_weights = nullptr;
@@ -4502,15 +4503,15 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_embd, n_hc, n_tokens, gated) + (projection_type == GGML_TYPE_COUNT ? "" : "," + VARS_TO_STR2(projection_type, computed)) + (ordered ? "," + VARS_TO_STR2(ordered, swap_add) : "") + (projection_rank == 127 ? "" : "," + VARS_TO_STR1(projection_rank)) + (reader_types ? "," + VARS_TO_STR1(reader_types) : "");
+        return VARS_TO_STR4(n_embd, n_hc, n_tokens, gated) + (projection_type == GGML_TYPE_COUNT ? "" : "," + VARS_TO_STR2(projection_type, computed)) + (ordered ? "," + VARS_TO_STR2(ordered, swap_add) : "") + (projection_rank == 127 ? "" : "," + VARS_TO_STR1(projection_rank)) + (reader_types ? "," + VARS_TO_STR1(reader_types) : "") + (consumer_type == GGML_TYPE_COUNT ? "" : "," + VARS_TO_STR1(consumer_type));
     }
 
-    bool run_whole_graph() override { return ordered || projection_type != GGML_TYPE_COUNT; }
-    std::vector<ggml_tensor *> fusion_test_nodes() override { return ordered || reader_types ? stages : projection ? std::vector<ggml_tensor *>{projection, out} : std::vector<ggml_tensor *>{}; }
-    double max_nmse_err() override { return reader_types ? 5e-4 : ordered ? 1e-7 : test_dsv4_hc::max_nmse_err(); }
+    bool run_whole_graph() override { return ordered || projection_type != GGML_TYPE_COUNT || consumer_type != GGML_TYPE_COUNT; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return ordered || reader_types || consumer_type != GGML_TYPE_COUNT ? stages : projection ? std::vector<ggml_tensor *>{projection, out} : std::vector<ggml_tensor *>{}; }
+    double max_nmse_err() override { return reader_types || consumer_type != GGML_TYPE_COUNT ? 5e-4 : ordered ? 1e-7 : test_dsv4_hc::max_nmse_err(); }
 
-    test_dsv4_hc_pre(int64_t n_embd = 31, int64_t n_hc = 4, int64_t n_tokens = 17, bool gated = false, ggml_type projection_type = GGML_TYPE_COUNT, bool computed = false, bool ordered = false, bool swap_add = false, int64_t projection_rank = 127, int reader_types = 0)
-        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens), gated(gated), projection_type(projection_type), computed(computed), ordered(ordered), swap_add(swap_add), projection_rank(projection_rank), reader_types(reader_types) {}
+    test_dsv4_hc_pre(int64_t n_embd = 31, int64_t n_hc = 4, int64_t n_tokens = 17, bool gated = false, ggml_type projection_type = GGML_TYPE_COUNT, bool computed = false, bool ordered = false, bool swap_add = false, int64_t projection_rank = 127, int reader_types = 0, ggml_type consumer_type = GGML_TYPE_COUNT)
+        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens), gated(gated), projection_type(projection_type), computed(computed), ordered(ordered), swap_add(swap_add), projection_rank(projection_rank), reader_types(reader_types), consumer_type(consumer_type) {}
 
     void initialize_tensors(ggml_context * ctx) override {
         test_dsv4_hc::initialize_tensors(ctx);
@@ -4577,6 +4578,13 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
             }
         }
         ggml_set_name(out, "out");
+        if (consumer_type != GGML_TYPE_COUNT) {
+            ggml_set_output(out);
+            auto * weights = ggml_new_tensor_2d(ctx, consumer_type, n_embd, 129);
+            auto * reader = ggml_mul_mat(ctx, weights, out);
+            stages = {out, reader};
+            return reader;
+        }
         if (reader_types) {
             GGML_ASSERT(projection);
             ggml_set_output(out);
@@ -9566,6 +9574,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_dsv4_hc_pre(512, 4, 32, false, GGML_TYPE_COUNT, false, true, swap_add));
     }
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q2_K}) {
+        for (bool gated : {false, true}) {
+            test_cases.emplace_back(new test_dsv4_hc_pre(512, 3, 33, gated, GGML_TYPE_COUNT, false, false, false, 127, 0, type));
+        }
+    }
+    test_cases.emplace_back(new test_dsv4_hc_pre(96, 5, 17, true, GGML_TYPE_COUNT, false, false, false, 127, 0, GGML_TYPE_Q4_0));
+    test_cases.emplace_back(new test_dsv4_hc_pre(64, 1, 17, false, GGML_TYPE_COUNT, false, false, false, 127, 0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_dsv4_hc_pre(768, 5, 17, true, GGML_TYPE_COUNT, false, false, false, 127, 0, GGML_TYPE_Q2_K));
+    test_cases.emplace_back(new test_dsv4_hc_pre(576, 33, 65, false, GGML_TYPE_COUNT, false, false, false, 127, 0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_dsv4_hc_pre(1, 4, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17));
     test_cases.emplace_back(new test_dsv4_hc_pre(128, 4, 257));
