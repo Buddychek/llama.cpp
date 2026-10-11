@@ -386,7 +386,9 @@ static void ggml_cuda_mmf_pair_columns(ggml_backend_cuda_context & ctx, const gg
     switch (first->ne[1]) {
 #define MMF_PAIR_COLS(c) case c: ggml_cuda_mmf_pair_warps<T, c>(ctx, first, second, warps, split, first_ops, second_ops); break
         MMF_PAIR_COLS(2); MMF_PAIR_COLS(3); MMF_PAIR_COLS(4); MMF_PAIR_COLS(5);
-        MMF_PAIR_COLS(6); MMF_PAIR_COLS(7); MMF_PAIR_COLS(8);
+        MMF_PAIR_COLS(6); MMF_PAIR_COLS(7); MMF_PAIR_COLS(8); MMF_PAIR_COLS(9);
+        MMF_PAIR_COLS(10); MMF_PAIR_COLS(11); MMF_PAIR_COLS(12); MMF_PAIR_COLS(13);
+        MMF_PAIR_COLS(14); MMF_PAIR_COLS(15); MMF_PAIR_COLS(16);
 #undef MMF_PAIR_COLS
         default: GGML_ABORT("unsupported column count");
     }
@@ -395,7 +397,7 @@ static void ggml_cuda_mmf_pair_columns(ggml_backend_cuda_context & ctx, const gg
 bool ggml_cuda_mul_mat_f_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * first, const ggml_tensor * second, const ggml_cuda_scaled_unary_args & first_ops, const ggml_cuda_scaled_unary_args & second_ops) {
     const auto & info = ggml_cuda_info().devices[ctx.device];
     if (!GGML_CUDA_CC_IS_NVIDIA(info.cc) || info.cc < GGML_CUDA_CC_AMPERE || info.warp_size != 32 ||
-            first->ne[1] < 2 || first->ne[1] > 8 || first->src[0]->type != second->src[0]->type ||
+            first->ne[1] < 2 || first->ne[1] > 16 || first->src[0]->type != second->src[0]->type ||
             (first->src[0]->type != GGML_TYPE_F16 && first->src[0]->type != GGML_TYPE_BF16)) { return false; }
     const int64_t k = first->src[0]->ne[0]/2;
     int warps = 1;

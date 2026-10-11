@@ -9523,6 +9523,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_unary(type, op, true, true, false, false, false, false, 3, std::array<int64_t, 2>{33, 32}));
             test_cases.emplace_back(new test_mul_mat_unary(type, op, true, true, true, false, false, false, 4, std::array<int64_t, 2>{32, 3}));
             test_cases.emplace_back(new test_mul_mat_unary(type, op, true, true, false, false, false, false, 8, std::array<int64_t, 2>{257, 65}));
+            test_cases.emplace_back(new test_mul_mat_unary(type, op, true, true, false, false, false, false, 9, std::array<int64_t, 2>{64, 32}));
+            test_cases.emplace_back(new test_mul_mat_unary(type, op, true, true, true, false, false, false, 16, std::array<int64_t, 2>{32, 64}));
         }
     }
 

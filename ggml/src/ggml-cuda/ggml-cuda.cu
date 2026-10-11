@@ -3951,7 +3951,7 @@ static bool ggml_cuda_mmvf_pair_compute_policy(const ggml_tensor * node, int dev
 
 static bool ggml_cuda_mmvf_pair_node(const ggml_tensor * node, int device, bool allocated) {
     if (node->op != GGML_OP_MUL_MAT || !(node->flags & GGML_TENSOR_FLAG_COMPUTE) || node->view_src ||
-            node->type != GGML_TYPE_F32 || !node->src[0] || !node->src[1] || node->ne[1] < 1 || node->ne[1] > MMVF_MAX_BATCH_SIZE ||
+            node->type != GGML_TYPE_F32 || !node->src[0] || !node->src[1] || node->ne[1] < 1 || node->ne[1] > 16 ||
             !ggml_is_contiguous(node) || ggml_cuda_op_mul_mat_use_fwht(node)) { return false; }
     const ggml_tensor * weight = node->src[0], * input = node->src[1];
     if ((weight->type != GGML_TYPE_F32 && weight->type != GGML_TYPE_F16 && weight->type != GGML_TYPE_BF16) ||
@@ -3967,6 +3967,8 @@ static bool ggml_cuda_mmvf_pair_node(const ggml_tensor * node, int device, bool 
         for (int d = 1; d < GGML_MAX_DIMS; ++d) {
             if (weight->nb[d] % (2*size)) { return false; }
         }
+        if (node->ne[1] > MMVF_MAX_BATCH_SIZE && (input->nb[1] % (4*sizeof(float)) || weight->nb[1] % (4*size) ||
+                ggml_cuda_mul_mat_kernel(weight, input, node, device) != GGML_CUDA_MM_MMF)) { return false; }
         if (!ggml_cuda_mmvf_pair_compute_policy(node, device, policy)) { return false; }
     }
     for (const ggml_tensor * tensor : {weight, input, node}) {
