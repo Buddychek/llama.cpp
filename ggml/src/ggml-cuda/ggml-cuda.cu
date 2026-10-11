@@ -4449,6 +4449,7 @@ struct ggml_cuda_norm_mmq_match {
     ggml_tensor * dst = nullptr;
     int last = -1;
     int image = -1;
+    int images[3] = {-1, -1, -1};
 };
 
 static ggml_cuda_norm_mmq_match ggml_cuda_match_norm_mmq(ggml_cgraph * graph, int i, int device) {
@@ -4590,6 +4591,47 @@ static std::vector<ggml_cuda_norm_mmq_match> ggml_cuda_plan_norm_mmq(ggml_cgraph
                 moved = true;
             }
         }
+        if (match.hc_pre && match.image >= 0) {
+            const auto & primary = reuse.groups[match.image];
+            const ggml_tensor * shape = graph->nodes[primary.node]->src[1];
+            const int primary_key = keys[primary.node];
+            if (primary_key >= 0 && primary_key <= 2 && shape->ne[2] == 1 && shape->ne[3] == 1) {
+                match.images[primary_key] = match.image;
+                if (found != readers.end()) {
+                    for (const int node : found->second) {
+                        const int key = keys[node];
+                        if (key < 0 || key > 2 || sizes[node] > SIZE_MAX - 255 || !can_emit(node, node) ||
+                                !ggml_are_same_shape(shape, graph->nodes[node]->src[1])) { continue; }
+                        int & target = match.images[key];
+                        const int previous = reuse.nodes[node];
+                        if (target >= 0 && previous == target) { continue; }
+                        if (previous >= 0 && !can_emit(reuse.groups[previous].node, reuse.groups[previous].prepare)) { continue; }
+                        if (target < 0) {
+                            target = previous;
+                            if (target < 0) {
+                                target = int(reuse.groups.size());
+                                reuse.groups.push_back({node, prepare, node, -1, true, GGML_PAD(sizes[node], 256)});
+                                removed.push_back(false);
+                            }
+                            reuse.groups[target].prepare = prepare;
+                            reuse.groups[target].after = true;
+                        } else if (previous >= 0) {
+                            reuse.groups[target].last = std::max(reuse.groups[target].last, reuse.groups[previous].last);
+                            reuse.groups[target].size = std::max(reuse.groups[target].size, reuse.groups[previous].size);
+                            for (int & member : reuse.nodes) { if (member == previous) { member = target; } }
+                            removed[previous] = true;
+                        }
+                        reuse.nodes[node] = target;
+                        reuse.groups[target].last = std::max(reuse.groups[target].last, node);
+                        reuse.groups[target].size = std::max(reuse.groups[target].size, GGML_PAD(sizes[node], 256));
+                        moved = true;
+                    }
+                }
+            }
+        }
+        if (std::count_if(std::begin(match.images), std::end(match.images), [](int g) { return g >= 0; }) < 2) {
+            for (int & image : match.images) { image = -1; }
+        }
         if (match.image >= 0) { emits[i] = match; }
     }
     if (moved) {
@@ -4602,7 +4644,10 @@ static std::vector<ggml_cuda_norm_mmq_match> ggml_cuda_plan_norm_mmq(ggml_cgraph
         }
         reuse.groups.resize(next);
         for (int & group : reuse.nodes) { if (group >= 0) { group = remap[group]; } }
-        for (auto & emit : emits) { if (emit.image >= 0) { emit.image = remap[emit.image]; } }
+        for (auto & emit : emits) {
+            if (emit.image >= 0) { emit.image = remap[emit.image]; }
+            for (int & image : emit.images) { if (image >= 0) { image = remap[image]; } }
+        }
         reuse.pack();
     }
     if (reuse.groups.empty()) { return {}; }
@@ -7401,6 +7446,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 const ggml_tensor * shared_input = q8_group >= 0 ? node->src[1] : nullptr;
                 const char * quantized = q8_group >= 0 ? q8_inputs[q8_group].get() : nullptr;
+                const auto hc_mmq_images = [&](const ggml_cuda_norm_mmq_match & emit) {
+                    const int g = emit.image, reader = mmq_reuse.groups[g].node;
+                    mmq_inputs[g].quantized.alloc(mmq_reuse.groups[g].size);
+                    ggml_cuda_hc_pre_mmq_emit_data images = {mmq_inputs[g].quantized.get(), GGML_PAD(emit.dst->ne[0], MATRIX_ROW_PADDING), mmq_keys[reader]};
+                    for (int layout = 0; layout < 3; ++layout) {
+                        const int group = emit.images[layout];
+                        if (group < 0) { continue; }
+                        if (group != g) { mmq_inputs[group].quantized.alloc(mmq_reuse.groups[group].size); }
+                        images.images[layout] = mmq_inputs[group].quantized.get();
+                    }
+                    return images;
+                };
                 if (node->op == GGML_OP_MUL_MAT && (!norm_emits.empty() || !q8_emits.empty() || !mmq_emits.empty()) && cuda_ctx->curr_stream_no == 0 && stream_ctx.concurrent_events.empty()) {
                     const auto up = ggml_cuda_match_hc_up(*cuda_ctx, cgraph, i);
                     const int last = i + up.count - 1;
@@ -7424,9 +7481,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         }
                         ggml_cuda_hc_pre_mmq_emit_data mmq_image = {};
                         if (mmq) {
-                            const int g = mmq_emits[last].image, reader = mmq_reuse.groups[g].node;
-                            mmq_inputs[g].quantized.alloc(mmq_reuse.groups[g].size);
-                            mmq_image = {mmq_inputs[g].quantized.get(), GGML_PAD(up.dst->ne[0], MATRIX_ROW_PADDING), mmq_keys[reader]};
+                            mmq_image = hc_mmq_images(mmq_emits[last]);
                         }
                         if (up.convert) {
                             ggml_cuda_mul_mat_cublas(*cuda_ctx, up.mm->src[0], up.mm->src[1], up.mm, prepared_src1, up.dst, nullptr, nullptr, typed ? &images : nullptr, q8 ? &quantized : nullptr, mmq ? &mmq_image : nullptr);
@@ -7498,8 +7553,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 if (!mmq_emits.empty() && mmq_emits[i].hc_pre) {
                     const auto & emit = mmq_emits[i];
-                    const int g = emit.image, reader = mmq_reuse.groups[g].node;
-                    mmq_inputs[g].quantized.alloc(mmq_reuse.groups[g].size);
+                    const auto mmq_images = hc_mmq_images(emit);
                     ggml_cuda_hc_pre_emit_data images;
                     if (!norm_emits.empty() && norm_emits[i].hc_pre) {
                         const auto image = [&](int group) -> void * {
@@ -7509,8 +7563,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         };
                         images.f16 = image(norm_emits[i].f16); images.bf16 = image(norm_emits[i].bf16);
                     }
-                    ggml_cuda_op_dsv4_hc_pre_mmq(*cuda_ctx, node, mmq_inputs[g].quantized.get(),
-                        GGML_PAD(node->ne[0], MATRIX_ROW_PADDING), mmq_keys[reader], images);
+                    ggml_cuda_op_dsv4_hc_pre_mmq_multi(*cuda_ctx, node, mmq_images, images);
                     continue;
                 }
                 if (!norm_emits.empty() && norm_emits[i].hc_pre) {

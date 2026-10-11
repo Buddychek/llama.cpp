@@ -563,6 +563,63 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
 }
 
+// Keep the single-image epilogue in place to preserve its scheduling.
+template <mmq_q8_1_ds_layout Layout>
+static __device__ __forceinline__ void dsv4_hc_pre_mmq_store(float value, int64_t column, int64_t row,
+        block_q8_1_mmq * image, int64_t padded, int64_t rows) {
+    const int lane = threadIdx.x%WARP_SIZE;
+    float amax = warp_reduce_max<WARP_SIZE>(fabsf(value));
+    if constexpr (Layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+        __shared__ float maxima[CUDA_QUANTIZE_BLOCK_SIZE/WARP_SIZE];
+        const int warp = threadIdx.x/WARP_SIZE;
+        if (lane == 0) { maxima[warp] = amax; }
+        __syncthreads();
+        amax = fmaxf(maxima[warp & ~1], maxima[warp | 1]);
+    }
+    float sum;
+    if constexpr (Layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+        const int first = lane & ~3;
+        const float x0 = __shfl_sync(0xFFFFFFFF, value, first, WARP_SIZE);
+        const float x1 = __shfl_sync(0xFFFFFFFF, value, first + 1, WARP_SIZE);
+        const float x2 = __shfl_sync(0xFFFFFFFF, value, first + 2, WARP_SIZE);
+        const float x3 = __shfl_sync(0xFFFFFFFF, value, first + 3, WARP_SIZE);
+        sum = x0 + x1 + x2 + x3;
+        constexpr int vals_per_sum = Layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
+#pragma unroll
+        for (int offset = vals_per_sum/2; offset >= 4; offset >>= 1) { sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE); }
+    }
+    const float d_inv = 127.0f/amax;
+    const float d = 1.0f/d_inv;
+    const int64_t ib = column/QK8_1_MMQ*rows + row;
+    const int iqs = column%QK8_1_MMQ;
+    image[ib].qs[iqs] = roundf(value*d_inv);
+    if constexpr (Layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+        if (iqs%16 == 0 && iqs < 96) {
+            image[ib].d2s6[2 + iqs/16] = sum;
+            if (iqs%64 == 0) { image[ib].d2s6[iqs/64] = d; }
+        }
+    } else if (iqs%32 == 0) {
+        if constexpr (Layout == MMQ_Q8_1_DS_LAYOUT_DS4) { image[ib].ds4[iqs/32] = make_half2(d, sum); }
+        else { image[ib].d4[iqs/32] = d; }
+    }
+    if (blockIdx.x + 1 == gridDim.x) {
+        for (int64_t tail = int64_t(gridDim.x)*blockDim.x + threadIdx.x; tail < padded; tail += blockDim.x) {
+            auto & zero = image[tail/QK8_1_MMQ*rows + row];
+            const int index = tail%QK8_1_MMQ;
+            zero.qs[index] = 0;
+            if constexpr (Layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+                if (index%16 == 0 && index < 96) {
+                    zero.d2s6[2 + index/16] = 0.0f;
+                    if (index%64 == 0) { zero.d2s6[index/64] = 0.0f; }
+                }
+            } else if (index%32 == 0) {
+                if constexpr (Layout == MMQ_Q8_1_DS_LAYOUT_DS4) { zero.ds4[index/32] = make_half2(0.0f, 0.0f); }
+                else { zero.d4[index/32] = 0.0f; }
+            }
+        }
+    }
+}
+
 template <mmq_q8_1_ds_layout Layout, bool Gated, typename Gate>
 static __device__ __forceinline__ void dsv4_hc_pre_mmq_impl(
         const float * x, const Gate weights, float * dst, int64_t cols, int64_t hc,
@@ -675,6 +732,54 @@ void ggml_cuda_op_dsv4_hc_pre_mmq(ggml_backend_cuda_context & ctx, ggml_tensor *
     }
 }
 
+template <bool Gated, typename Gate>
+static __global__ void dsv4_hc_pre_mmq_multi(const float * x, Gate weights, float * dst, int64_t cols, int64_t hc,
+        int64_t sx0, int64_t sx1, int64_t sx2, int64_t sw0, int64_t sw1, int64_t sw2,
+        int64_t sd0, int64_t sd1, float scale, ggml_cuda_hc_pre_mmq_emit_data mmq, int64_t rows, ggml_cuda_hc_pre_emit_data images) {
+    ggml_cuda_pdl_lc();
+    const int64_t column = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t row = blockIdx.y;
+    ggml_cuda_pdl_sync();
+    float value = 0.0f;
+    if (column < cols) {
+        value = scale*dsv4_hc_pre_sum<Gated>(x, weights, column, row, hc, sx0, sx1, sx2, sw0, sw1, sw2);
+        dst[column*sd0 + row*sd1] = value;
+        if (images.f16) { ((half *) images.f16)[row*cols + column] = ggml_cuda_cast<half>(value); }
+        if (images.bf16) { ((nv_bfloat16 *) images.bf16)[row*cols + column] = ggml_cuda_cast<nv_bfloat16>(value); }
+    }
+    auto * d4 = (block_q8_1_mmq *) mmq.images[0];
+    auto * ds4 = (block_q8_1_mmq *) mmq.images[1];
+    auto * d2s6 = (block_q8_1_mmq *) mmq.images[2];
+    const int64_t padded = mmq.padded;
+    if (d4) { dsv4_hc_pre_mmq_store<MMQ_Q8_1_DS_LAYOUT_D4>(value, column, row, d4, padded, rows); }
+    if (ds4) { dsv4_hc_pre_mmq_store<MMQ_Q8_1_DS_LAYOUT_DS4>(value, column, row, ds4, padded, rows); }
+    if (d2s6) { dsv4_hc_pre_mmq_store<MMQ_Q8_1_DS_LAYOUT_D2S6>(value, column, row, d2s6, padded, rows); }
+}
+
+
+template <bool Gated, typename Gate>
+static void ggml_cuda_hc_pre_mmq_multi_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        Gate weights, const ggml_cuda_hc_pre_mmq_emit_data & mmq, const ggml_cuda_hc_pre_emit_data & images) {
+    const ggml_tensor * x = dst->src[0], * view = dst->src[1];
+    const int block = CUDA_QUANTIZE_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params params(dim3((dst->ne[0] + block - 1)/block, dst->ne[1]), dim3(block), 0, ctx.stream());
+    ggml_cuda_kernel_launch(dsv4_hc_pre_mmq_multi<Gated, Gate>, params, (const float *) x->data, weights,
+        (float *) dst->data, dst->ne[0], x->ne[1], int64_t(x->nb[0]/4), int64_t(x->nb[1]/4), int64_t(x->nb[2]/4),
+        int64_t(view->nb[0]/4), int64_t(view->nb[1]/4), int64_t(view->nb[2]/4),
+        int64_t(dst->nb[0]/4), int64_t(dst->nb[1]/4), ggml_get_op_params_f32(dst, 0), mmq, dst->ne[1], images);
+}
+
+void ggml_cuda_op_dsv4_hc_pre_mmq_multi(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_cuda_hc_pre_mmq_emit_data & mmq, const ggml_cuda_hc_pre_emit_data & images) {
+    if (!mmq.images[0] && !mmq.images[1] && !mmq.images[2]) {
+        ggml_cuda_op_dsv4_hc_pre_mmq(ctx, dst, mmq.data, mmq.padded, mmq.layout, images);
+        return;
+    }
+    const ggml_cuda_hc_gate_f32 weights = {(const float *) dst->src[1]->data};
+    if (ggml_get_op_params_i32(dst, 1)) { ggml_cuda_hc_pre_mmq_multi_launch<true>(ctx, dst, weights, mmq, images); }
+    else { ggml_cuda_hc_pre_mmq_multi_launch<false>(ctx, dst, weights, mmq, images); }
+}
+
 template <mmq_q8_1_ds_layout Layout>
 static void ggml_cuda_hc_pre_convert_mmq_launch(ggml_backend_cuda_context & ctx, ggml_type type, const void * weights,
         ggml_tensor * mm, ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data * images, const ggml_cuda_hc_pre_mmq_emit_data & mmq) {
@@ -696,6 +801,16 @@ static void ggml_cuda_hc_pre_convert_mmq_launch(ggml_backend_cuda_context & ctx,
 
 static void ggml_cuda_hc_pre_convert_mmq(ggml_backend_cuda_context & ctx, ggml_type type, const void * weights,
         ggml_tensor * mm, ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data * images, const ggml_cuda_hc_pre_mmq_emit_data & mmq) {
+    if (mmq.images[0] || mmq.images[1] || mmq.images[2]) {
+        const auto launch = [&](auto tag) {
+            using T = decltype(tag);
+            ggml_cuda_hc_pre_mmq_multi_launch<true>(ctx, dst, ggml_cuda_hc_gate_convert<T>{(const T *) weights, (float *) mm->data}, mmq,
+                images ? *images : ggml_cuda_hc_pre_emit_data{});
+        };
+        if (type == GGML_TYPE_F16) { launch(half{}); }
+        else { GGML_ASSERT(type == GGML_TYPE_BF16); launch(nv_bfloat16{}); }
+        return;
+    }
     switch (mmq.layout) {
         case MMQ_Q8_1_DS_LAYOUT_D4: ggml_cuda_hc_pre_convert_mmq_launch<MMQ_Q8_1_DS_LAYOUT_D4>(ctx, type, weights, mm, dst, images, mmq); break;
         case MMQ_Q8_1_DS_LAYOUT_DS4: ggml_cuda_hc_pre_convert_mmq_launch<MMQ_Q8_1_DS_LAYOUT_DS4>(ctx, type, weights, mm, dst, images, mmq); break;
