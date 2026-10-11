@@ -3031,6 +3031,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_HYBRID"));
     add_opt(common_arg(
+        {"--moe-prefill-workspace"}, "separate|borrow",
+        "hybrid prefill temporary storage: separate (default) or borrow expert cache payloads; experimental",
+        [](common_params & params, const std::string & value) {
+            if (value != "separate" && value != "borrow") { throw std::invalid_argument("--moe-prefill-workspace must be separate or borrow"); }
+            params.moe_prefill_workspace = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREFILL_WORKSPACE"));
+    add_opt(common_arg(
         {"--moe-gpu-miss-fraction"}, "F",
         "fraction of distinct hybrid expert cache misses transferred to GPU, in [0,1] (initial default: 0.17, CPU-measured tuning); resident hits use GPU",
         [](common_params & params, const std::string & value) {

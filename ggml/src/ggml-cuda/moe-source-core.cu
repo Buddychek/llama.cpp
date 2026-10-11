@@ -690,6 +690,31 @@ struct core_session {
     std::vector<std::shared_ptr<void>> leaf_resource_leases;
     uint64_t resource_identity = 0;
     ggml_cuda_moe_source_transport * transport = nullptr;
+    struct workspace_buffer_type {
+        ggml_backend_buffer_type type;
+        core_session * session = nullptr;
+    } workspace_type = {};
+    std::shared_ptr<ggml_cuda_moe_prefill_workspace> workspace;
+    bool workspace_active = false;
+    ggml_backend_buffer_type_t private_buffer_type() {
+        return workspace ? &workspace_type.type : ggml_backend_get_default_buffer_type(config.backend);
+    }
+    ggml_backend_buffer_t allocate_private_buffer(size_t bytes) {
+        auto original = ggml_backend_get_default_buffer_type(config.backend);
+        if (!workspace || bytes > SIZE_MAX - 255 || GGML_PAD(bytes, 256) > owner().prefill_workspace_available(workspace)) {
+            return ggml_backend_buft_alloc_buffer(original, bytes);
+        }
+        workspace_active = true;
+        auto buffer = owner().allocate_prefill_workspace(workspace, bytes, stream);
+        if (!buffer) { effect_failure = true; }
+        return buffer;
+    }
+    bool return_workspace(uint64_t expiry) {
+        if (!workspace_active) { return true; }
+        if (!owner().return_prefill_workspace(workspace, stream, expiry, transport, &owner_execution)) { return false; }
+        workspace_active = false;
+        return true;
+    }
     ggml_backend_buffer_t arena = nullptr;
     ggml_backend_buffer_t pool_arena = nullptr;
     size_t pool_arena_bytes = 0;
@@ -1575,6 +1600,19 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
     const bool main_prefill = graph->execution_certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN &&
         graph->execution_certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL &&
         graph->execution_certificate.n_rows > 1;
+    bool lend_prefill = false;
+    if (!option("GGML_MOE_SOURCE_PREFILL_LEND", lend_prefill)) { return false; }
+    stream = parent->stream();
+    if (main_prefill && lend_prefill) {
+        workspace = owner().prepare_prefill_workspace();
+        if (!workspace) { return false; }
+        workspace_type.type = *ggml_backend_get_default_buffer_type(config.backend);
+        workspace_type.session = this;
+        workspace_type.type.iface.alloc_buffer_n = nullptr;
+        workspace_type.type.iface.alloc_buffer = [](ggml_backend_buffer_type_t type, size_t bytes) {
+            return reinterpret_cast<workspace_buffer_type *>(type)->session->allocate_private_buffer(bytes);
+        };
+    }
     source_cpu_range preparation_trace(cpu_profile && main_prefill, "generic.prefill.prepare", program_instance, 0);
     schedule.overlap_independent_ordinary = overlap_enabled && !main_prefill;
     schedule.leaf_context = this;
@@ -1646,7 +1684,7 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
             }
         }
     }
-    if (!program->prepare(graph, experts, ggml_backend_get_default_buffer_type(config.backend), schedule)) {
+    if (!program->prepare(graph, experts, private_buffer_type(), schedule)) {
         program.reset();
         return false;
     }
@@ -1708,7 +1746,7 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
             first += body->count;
             prefill_bodies.push_back(std::move(body));
         }
-        if (!prefill_bodies.empty() && !program->prepare(graph, experts, ggml_backend_get_default_buffer_type(config.backend), schedule)) { return false; }
+        if (!prefill_bodies.empty() && !program->prepare(graph, experts, private_buffer_type(), schedule)) { return false; }
     }
     preparation_trace.mark("generic.prefill.body_plan_ready");
     if (!fits_device_budget(program->storage_bytes()) || !reserve_private_resources(program->storage_bytes(), 0) ||
@@ -1924,7 +1962,7 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
             image_bytes > SIZE_MAX - GGML_PAD(pool_bytes, 256)) { return false; }
     pool_bytes = GGML_PAD(pool_bytes, 256) + image_bytes;
     for (auto & body : prefill_bodies) {
-        if (!body->prepare(*program, ggml_backend_get_default_buffer_type(config.backend), parent->device, pinned_bytes)) { return false; }
+        if (!body->prepare(*program, private_buffer_type(), parent->device, pinned_bytes)) { return false; }
         prefill_body_bytes = std::max(prefill_body_bytes, body->planned_bytes);
         size_t roots_bytes = 0, operation_bytes = 0;
         const auto mmq_bytes = [&](const ggml_tensor * node, size_t & input_bytes, size_t & launch_bytes) {
@@ -1964,13 +2002,20 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
             !reserve(device_bytes, quant_bytes, quant_offset) ||
             !reserve(device_bytes, selected_bytes, selected_offset) ||
             !reserve(device_bytes, cpu_bytes, cpu_device_offset) ||
-            !reserve(device_bytes, pool_bytes, pool_offset) ||
+            !reserve(device_bytes, workspace ? 0 : pool_bytes, pool_offset) ||
             !reserve(device_bytes, cublas_bytes, cublas_offset) ||
             program->storage_bytes() > SIZE_MAX - device_bytes ||
             !fits_device_budget(device_bytes + program->storage_bytes()) ||
             (config.pinned_bytes && pinned_bytes > config.pinned_bytes) ||
             !reserve_private_resources(device_bytes + program->storage_bytes(), pinned_bytes)) { return false; }
-    arena = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(config.backend), device_bytes);
+    if (workspace && pool_bytes) {
+        pool_arena = allocate_private_buffer(pool_bytes);
+        if (!pool_arena) { return false; }
+        pool_arena_bytes = ggml_backend_buffer_get_size(pool_arena);
+        if (pool_arena_bytes > SIZE_MAX - device_bytes) { return false; }
+        device_bytes += pool_arena_bytes;
+    }
+    arena = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(config.backend), device_bytes - pool_arena_bytes);
     if (!arena || cudaHostAlloc(&host, pinned_bytes, cudaHostAllocMapped) != cudaSuccess) { return false; }
     for (auto & body : prefill_bodies) { if (!ggml_gallocr_reserve(body->allocator.get(), body->graph)) { return false; } }
     for (auto & body : prefill_bodies) {
@@ -2013,7 +2058,8 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
     }
     if (!alias) { noalias = true; segmented = true; }
     device_tail &= !segmented;
-    compute->pools[parent->device][0] = std::make_unique<ggml_cuda_pool_buffer>(data() + pool_offset, pool_bytes);
+    compute->pools[parent->device][0] = std::make_unique<ggml_cuda_pool_buffer>(pool_arena ?
+        static_cast<uint8_t *>(ggml_backend_buffer_get_base(pool_arena)) : data() + pool_offset, pool_bytes);
     if (cublas_bytes && !ggml_cuda_moe_fidelity_prepare_cublas(*compute, data() + cublas_offset, cublas_bytes)) { return false; }
     uint32_t mmids = 0;
     uint64_t fingerprint = 0;
@@ -2042,7 +2088,8 @@ bool core_session::allocate(const ggml_cgraph * graph, const std::vector<core_re
     if (replay_diagnostic) { fprintf(stderr, "moe-source-core-preparation: stage=profiles_ready apply_wall_ns=%llu elapsed_ns=%llu\n", (unsigned long long) profile_elapsed, (unsigned long long) (now_ns() - preparation_started)); }
     const uint64_t capture_started = now_ns();
     if (!prepare_capture_resources() ||
-            !wait_stream(stream, now_ns() + 5'000'000'000ull) || !finish_owner()) { return false; }
+            !wait_stream(stream, now_ns() + 5'000'000'000ull) ||
+            !return_workspace(now_ns() + 30'000'000'000ull) || !finish_owner()) { return false; }
     resources_live = false;
     preparation_trace.mark("generic.prefill.capture_ready");
     if (replay_diagnostic) { fprintf(stderr, "moe-source-core-preparation: stage=capture_ready capture_wall_ns=%llu elapsed_ns=%llu\n", (unsigned long long) (now_ns() - capture_started), (unsigned long long) (now_ns() - preparation_started)); }
@@ -2960,7 +3007,7 @@ int32_t core_session::drain(bool internal) {
     if (!terminal_lock.try_lock_until(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(expiry)))) {
         return done(GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_TIMEOUT);
     }
-    if (prepared && !resources_live && !dispatch && !hook) { return done(GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK); }
+    if (prepared && !resources_live && !dispatch && !hook && !workspace_active) { return done(GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK); }
     if (parent) { ggml_cuda_set_device(parent->device); }
     if (!wait_stream(stream, expiry) || !wait_stream(io, expiry)) { return done(GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_TIMEOUT); }
     // Controlled CPU calls finish synchronously before this caller can retire.
@@ -2971,7 +3018,7 @@ int32_t core_session::drain(bool internal) {
             return done(GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_FAILED);
         }
     }
-    if (!finish_owner()) { return done(GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_FAILED); }
+    if (!return_workspace(expiry) || !finish_owner()) { return done(GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_FAILED); }
     resources_live = false;
     return done(GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK);
 }
@@ -3207,7 +3254,9 @@ ggml_status core_session::replay_prefill() {
             }
         }
     } scheduled{*this};
-    bool ok = acquire_owner(false);
+    bool ok = !workspace || owner().acquire_prefill_workspace(workspace, stream);
+    workspace_active |= workspace != nullptr;
+    ok = ok && acquire_owner(false);
     *result() = {};
     result()->epoch = epoch;
     for (uint32_t i = 0; i < layers.size(); ++i) {
@@ -3387,7 +3436,8 @@ ggml_status core_session::replay_prefill() {
         ok &= finished;
         prefill_schedule_token = 0;
     }
-    if (ok && config.profile_adaptation) { ok = apply_profiles(false, true) && wait_stream(io, deadline) && !canceled.load(); }
+    const bool deferred_adaptation = workspace_active && config.profile_adaptation;
+    if (ok && config.profile_adaptation && !deferred_adaptation) { ok = apply_profiles(false, true) && wait_stream(io, deadline) && !canceled.load(); }
     if (ok && hook) { ok = hook(hook_data, GGML_BACKEND_MOE_HYBRID_TEST_BEFORE_PUBLISH, epoch, stream); }
     if (ok) {
         for (const auto * original : program->public_outputs()) {
@@ -3397,6 +3447,10 @@ ggml_status core_session::replay_prefill() {
                     cudaMemcpyAsync(original->data, output->data, ggml_nbytes(output), cudaMemcpyDeviceToDevice, stream) != cudaSuccess) { ok = false; break; }
         }
         if (ok) { ok = wait_stream(stream, deadline) && !canceled.load(); }
+    }
+    if (ok && deferred_adaptation) {
+        ok = return_workspace(deadline) && finish_owner() && acquire_owner(false) &&
+            apply_profiles(false, true) && wait_stream(io, deadline) && !canceled.load();
     }
     if (!ok) { stop(); }
     const auto drained = drain(true);

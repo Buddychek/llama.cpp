@@ -1051,6 +1051,12 @@ void common_moe_hybrid_configure(const common_params & params) {
             throw std::invalid_argument("--moe-gpu-miss-fraction must be finite and in [0,1]");
         }
     }
+    if (!params.moe_prefill_workspace.empty() && params.moe_prefill_workspace != "separate" && params.moe_prefill_workspace != "borrow") {
+        throw std::invalid_argument("--moe-prefill-workspace must be separate or borrow");
+    }
+    if (!params.moe_prefill_workspace.empty()) {
+        common_set_env("GGML_MOE_SOURCE_PREFILL_LEND", params.moe_prefill_workspace == "borrow" ? "1" : "0");
+    }
     if (!params.moe_gpu_miss_tuning.empty() && params.moe_gpu_miss_tuning != "on" && params.moe_gpu_miss_tuning != "off") {
         throw std::invalid_argument("--moe-gpu-miss-tuning must be on or off");
     }

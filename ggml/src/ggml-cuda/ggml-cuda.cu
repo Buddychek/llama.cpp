@@ -783,6 +783,7 @@ struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+    bool owns_data = true;
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -790,7 +791,7 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (owns_data) { CUDA_CHECK(cudaFree(dev_ptr)); }
     }
 };
 
@@ -959,6 +960,14 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
 
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+}
+
+ggml_backend_buffer_t ggml_cuda_moe_buffer_view(int device, void * data, size_t bytes) {
+    if (!data || !bytes || reinterpret_cast<uintptr_t>(data) % 256) { return nullptr; }
+    auto * context = new (std::nothrow) ggml_backend_cuda_buffer_context(device, data);
+    if (!context) { return nullptr; }
+    context->owns_data = false;
+    return ggml_backend_buffer_init(ggml_backend_cuda_buffer_type(device), ggml_backend_cuda_buffer_interface, context, bytes);
 }
 
 static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {

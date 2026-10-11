@@ -34,6 +34,7 @@ Example settings from the qualified single-GPU configuration; choose context, sl
 | Control | Default and meaning |
 |---|---|
 | `--moe-hybrid on` | Opt into the generic source executor with checked failures. Ordinary execution remains the default; `off` overrides inherited hybrid activation. |
+| `--moe-prefill-workspace separate\|borrow` | Separate temporary storage by default. Experimental borrowing reuses expert payload storage for prefill scratch, then restores displaced experts. Cache capacity stays fixed. See [workspace lending](moe-prefill-workspace.md). |
 | `--moe-gpu-miss-fraction F` | Explicit fixed fraction of distinct cache misses transferred to GPU, finite in [0,1] at 1/256 resolution. Overrides automatic tuning; resident hits already use GPU. |
 | `--moe-gpu-miss-tuning on\|off` | CPU-measured hardware tuning when no fraction is supplied (default: on). Starts at 0.17, measures CPU worker service and a bounded H2D sample, then makes up to three updates between successful decode windows. |
 | `--moe-miss-keep-ranks N` | Approximate decode only, off by default (`0`). On nonresident routes, retain at least the highest N actual weight ranks in each request window. Ties and resident hits execute. Omitted rows are zero; remaining weights are not renormalized. |

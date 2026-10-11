@@ -5953,6 +5953,8 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
     const bool body_prefill = prefill_stream || (fidelity_mode && !strcmp(fidelity_mode, "source-core-prefill-body"));
     const bool body_tail = body_prefill && getenv("GGML_TEST_MOE_BODY_TAIL") && !strcmp(getenv("GGML_TEST_MOE_BODY_TAIL"), "1");
     const bool main_prefill = body_prefill || (fidelity_mode && !strcmp(fidelity_mode, "source-core-prefill"));
+    const char * lending_option = getenv("GGML_MOE_SOURCE_PREFILL_LEND");
+    const bool lending = main_prefill && lending_option && !strcmp(lending_option, "1");
     const bool approximate = ggml_moe_fidelity_selection().keep_ranks && !main_prefill;
     struct source_environment {
         bool enabled;
@@ -6884,7 +6886,7 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
             allocate_inputs();
             allocate_regions();
         }
-        const bool retained_hook_test = source_core && !profile_adaptation && !staged_inputs && (!delayed_cancel || approximate) && !early_fallback && !overlap_fixture;
+        const bool retained_hook_test = source_core && (!profile_adaptation || (main_prefill && profile_adaptation == 1)) && !staged_inputs && (!delayed_cancel || approximate) && !early_fallback && !overlap_fixture;
         std::atomic<uint32_t> hook_calls{0};
         struct body_observation {
             std::atomic<uint32_t> * calls;
@@ -7474,7 +7476,13 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
                     CHECK(captures == 0 && state.window_launches == uint64_t(step + 1) * config.max_regions &&
                         (body_prefill ? state.window_waits <= state.window_launches : state.window_waits == state.window_launches) &&
                         state.window_fallbacks == 0 && state.errors == 0 &&
-                        state.resident_routes > 0 && state.transfer_routes > 0);
+                        (lending || state.resident_routes > 0) && state.transfer_routes > 0);
+                    if (lending) {
+                        if (!profile_adaptation) { CHECK(read_residency() == initial_residency); }
+                        CHECK(payload_mismatches() == 0);
+                        CHECK(state.resident_routes + state.transfer_routes + state.cpu_routes ==
+                            state.window_launches * capacity * routes);
+                    }
                     CHECK(state.cpu_routes <= uint64_t(step + 1) * config.max_regions * config.n_threads);
                     if (body_prefill && ggml_is_quantized(signature.gate_up_type)) { CHECK(state.window_waits == uint64_t(step + 1) * 2); }
                     // Fixed routing repeats each cohort for the whole prompt; stream heavy cohorts.
@@ -8067,7 +8075,7 @@ void test_fidelity_real_window(int device, uint32_t capacity, uint32_t arm, bool
             auto * released = owner->sched.release();
             CHECK(ggml_backend_sched_moe_source_free_v1(&released) == GGML_BACKEND_MOE_SOURCE_CORE_STATUS_V1_OK && !released);
         } else { owner->sched.reset(); }
-        if (static_profile) {
+        if (static_profile && !main_prefill) {
             const auto retained_state = grouped->state();
             const auto retired_residency = read_residency();
             std::array<ggml_cuda_moe_candidate_group_key, 2> retained_keys;
@@ -9739,6 +9747,12 @@ void test_hybrid_metadata() {
                             false, 0, false, false, true);
                     }
                 }
+            }
+            const char * lending = getenv("GGML_MOE_SOURCE_PREFILL_LEND");
+            if (lending && !strcmp(lending, "1")) {
+                const hybrid_layer_signature signature{GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K, LLM_FFN_SILU, 256, 256};
+                test_fidelity_real_window(device, 65, GGML_CUDA_MOE_FIDELITY_POLL, false, true, signature, 4, 1, 16,
+                    false, 0, false, false, true, false, false, false, false, 0, false, true, 1);
             }
             if (!strcmp(mode, "source-core-prefill-stream")) {
                 const hybrid_layer_signature staged_signature{GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_NL, LLM_FFN_SILU, 1024, 256};

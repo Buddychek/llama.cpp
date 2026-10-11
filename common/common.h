@@ -564,6 +564,7 @@ struct common_params {
     std::string moe_cache_allocation = "auto";
     bool moe_early_router = false;
     std::string moe_hybrid; // empty preserves the process environment
+    std::string moe_prefill_workspace;
     std::string moe_gpu_miss_fraction;
     std::string moe_gpu_miss_tuning;
     int32_t moe_miss_keep_ranks = -1;

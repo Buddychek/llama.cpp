@@ -223,6 +223,10 @@ struct ggml_cuda_moe_hybrid_reference_view {
 };
 
 struct ggml_cuda_moe_source_transport;
+struct ggml_cuda_moe_prefill_workspace;
+
+// The caller retains backing and drains readers before it releases a device view.
+ggml_backend_buffer_t ggml_cuda_moe_buffer_view(int device, void * data, size_t bytes);
 
 struct ggml_cuda_moe_source_transport_stats {
     uint64_t direct_calls = 0, direct_bytes = 0;
@@ -1334,6 +1338,16 @@ public:
             const int32_t * unique_experts,
             uint32_t n_unique_experts);
     size_t prefill_staging_capacity_bytes() const;
+    std::shared_ptr<ggml_cuda_moe_prefill_workspace> prepare_prefill_workspace();
+    ggml_backend_buffer_t allocate_prefill_workspace(const std::shared_ptr<ggml_cuda_moe_prefill_workspace> & workspace,
+            size_t bytes, ggml_cuda_moe_stream_t stream);
+    bool acquire_prefill_workspace(const std::shared_ptr<ggml_cuda_moe_prefill_workspace> & workspace,
+            ggml_cuda_moe_stream_t stream);
+    bool return_prefill_workspace(const std::shared_ptr<ggml_cuda_moe_prefill_workspace> & workspace,
+            ggml_cuda_moe_stream_t stream, uint64_t deadline_ns, ggml_cuda_moe_source_transport * transport = nullptr,
+            const ggml_cuda_moe_graph_execution * execution = nullptr);
+    size_t prefill_workspace_bytes(const std::shared_ptr<ggml_cuda_moe_prefill_workspace> & workspace) const;
+    size_t prefill_workspace_available(const std::shared_ptr<ggml_cuda_moe_prefill_workspace> & workspace) const;
     bool prefill_body_fits(const ggml_tensor * const * banks, uint32_t count) const;
     bool begin_prefill_schedule(const std::vector<ggml_cuda_moe_prefill_phase> & phases,
             ggml_cuda_moe_stream_t stream, uint64_t * token);
