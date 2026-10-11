@@ -3,6 +3,7 @@
 #include "unary.cuh"
 #include "mmvf.cuh"
 #include "convert.cuh"
+#include "dsv4-hc.cuh"
 
 template <typename T, typename Acc, int Block, bool LaunchComplete = true>
 static __device__ __forceinline__ float mmvf_packed_dot(const T * x, const float * y, int ncols2, bool valid) {
@@ -1057,11 +1058,24 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
     }
 }
 
-template <typename T, typename Acc, int Block>
-static __global__ void mul_mat_vec_f_hc_packed_rows(
+struct ggml_cuda_mmvf_hc_output {
+    __device__ __forceinline__ void operator()(float * dst, int64_t index, float value) const { dst[index] = value; }
+};
+
+struct ggml_cuda_mmvf_hc_images {
+    ggml_cuda_hc_pre_emit_data images;
+    __device__ __forceinline__ void operator()(float * dst, int64_t index, float value) const {
+        dst[index] = value;
+        if (images.f16) { ((half *) images.f16)[index] = ggml_cuda_cast<half>(value); }
+        if (images.bf16) { ((nv_bfloat16 *) images.bf16)[index] = ggml_cuda_cast<nv_bfloat16>(value); }
+    }
+};
+
+template <typename T, typename Acc, int Block, typename Store>
+static __device__ __forceinline__ void mul_mat_vec_f_hc_packed_impl(
         const T * weight, const float * input, const float * norm, float * gate, float * dst,
         int k2, int weight_stride, int n, int hc,
-        int64_t norm_stride0, int64_t norm_stride1, float scale) {
+        int64_t norm_stride0, int64_t norm_stride1, float scale, Store write) {
     const uint32_t i0 = blockIdx.x*4 + threadIdx.y;
     const bool valid = i0 < uint32_t(n);
     float sum = 0.0f;
@@ -1077,7 +1091,23 @@ static __global__ void mul_mat_vec_f_hc_packed_rows(
         }
     }
     ggml_cuda_pdl_lc();
-    if (valid && threadIdx.x == 0) { dst[i0] = scale*sum; }
+    if (valid && threadIdx.x == 0) { write(dst, i0, scale*sum); }
+}
+
+template <typename T, typename Acc, int Block>
+static __global__ void mul_mat_vec_f_hc_packed_rows(
+        const T * weight, const float * input, const float * norm, float * gate, float * dst,
+        int k2, int weight_stride, int n, int hc,
+        int64_t norm_stride0, int64_t norm_stride1, float scale) {
+    mul_mat_vec_f_hc_packed_impl<T, Acc, Block>(weight, input, norm, gate, dst, k2, weight_stride, n, hc, norm_stride0, norm_stride1, scale, ggml_cuda_mmvf_hc_output{});
+}
+
+template <typename T, typename Acc, int Block>
+static __global__ void mul_mat_vec_f_hc_packed_images(
+        const T * weight, const float * input, const float * norm, float * gate, float * dst,
+        int k2, int weight_stride, int n, int hc,
+        int64_t norm_stride0, int64_t norm_stride1, float scale, ggml_cuda_hc_pre_emit_data images) {
+    mul_mat_vec_f_hc_packed_impl<T, Acc, Block>(weight, input, norm, gate, dst, k2, weight_stride, n, hc, norm_stride0, norm_stride1, scale, ggml_cuda_mmvf_hc_images{images});
 }
 
 struct ggml_cuda_mmvf_hc_store {
@@ -1097,11 +1127,11 @@ struct ggml_cuda_mmvf_hc_store {
     }
 };
 
-template <typename T, typename type_acc, int columns, int block_size>
-static __global__ void mul_mat_vec_f_hc_pre(
+template <typename T, typename type_acc, int columns, int block_size, typename Store>
+static __device__ __forceinline__ void mul_mat_vec_f_hc_impl(
         const T * weight, const float * input, const float * norm, float * gate, float * dst,
         int k2, int weight_stride, int input_stride, int gate_stride, int n, int hc,
-        int64_t norm_stride0, int64_t norm_stride1, int64_t norm_stride2, int64_t dst_stride, float scale) {
+        int64_t norm_stride0, int64_t norm_stride1, int64_t norm_stride2, int64_t dst_stride, float scale, Store store) {
     const uint3 one = make_uint3(1, 0, 1);
     const int i0 = blockIdx.x;
     const int tid = threadIdx.x;
@@ -1117,8 +1147,24 @@ static __global__ void mul_mat_vec_f_hc_pre(
     }
     ggml_cuda_pdl_lc();
     if (tid < columns) {
-        dst[int64_t(tid)*dst_stride + i0] = scale * sum;
+        store(dst, int64_t(tid)*dst_stride + i0, scale * sum);
     }
+}
+
+template <typename T, typename type_acc, int columns, int block_size>
+static __global__ void mul_mat_vec_f_hc_pre(
+        const T * weight, const float * input, const float * norm, float * gate, float * dst,
+        int k2, int weight_stride, int input_stride, int gate_stride, int n, int hc,
+        int64_t norm_stride0, int64_t norm_stride1, int64_t norm_stride2, int64_t dst_stride, float scale) {
+    mul_mat_vec_f_hc_impl<T, type_acc, columns, block_size>(weight, input, norm, gate, dst, k2, weight_stride, input_stride, gate_stride, n, hc, norm_stride0, norm_stride1, norm_stride2, dst_stride, scale, ggml_cuda_mmvf_hc_output{});
+}
+
+template <typename T, typename type_acc, int columns, int block_size>
+static __global__ void mul_mat_vec_f_hc_images(
+        const T * weight, const float * input, const float * norm, float * gate, float * dst,
+        int k2, int weight_stride, int input_stride, int gate_stride, int n, int hc,
+        int64_t norm_stride0, int64_t norm_stride1, int64_t norm_stride2, int64_t dst_stride, float scale, ggml_cuda_hc_pre_emit_data images) {
+    mul_mat_vec_f_hc_impl<T, type_acc, columns, block_size>(weight, input, norm, gate, dst, k2, weight_stride, input_stride, gate_stride, n, hc, norm_stride0, norm_stride1, norm_stride2, dst_stride, scale, ggml_cuda_mmvf_hc_images{images});
 }
 
 static int ggml_cuda_mmvf_hc_block_size(int64_t ncols, int device) {
@@ -1407,7 +1453,7 @@ bool ggml_cuda_should_fuse_hc_up(const ggml_tensor * weight, const ggml_tensor *
 }
 
 template <typename T, typename Acc, int Columns, int Block>
-static void ggml_cuda_mmvf_hc_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * dst) {
+static void ggml_cuda_mmvf_hc_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data * images) {
     const ggml_tensor * weight = mm->src[0];
     const ggml_tensor * input = mm->src[1];
     const ggml_tensor * norm = dst->src[0];
@@ -1419,64 +1465,79 @@ static void ggml_cuda_mmvf_hc_launch(ggml_backend_cuda_context & ctx, const ggml
                 norm->ne[0] <= INT32_MAX && norm->ne[1] <= INT32_MAX && weight->nb[1]/sizeof(T) <= INT32_MAX &&
                 weight->ne[0] % 8 == 0 && weight->ne[0]/2 <= Block && (alignment & 15) == 0) {
             const ggml_cuda_kernel_launch_params params = {dim3((uint64_t(norm->ne[0]) + 3)/4, 1, 1), dim3(32, 4, 1), 0, ctx.stream()};
-            ggml_cuda_kernel_launch(mul_mat_vec_f_hc_packed_rows<T, Acc, Block>, params,
-                (const T *) weight->data, (const float *) input->data, (const float *) norm->data, (float *) mm->data, (float *) dst->data,
-                int(weight->ne[0]/2), int(weight->nb[1]/sizeof(T)), int(norm->ne[0]), int(norm->ne[1]),
-                int64_t(norm->nb[0]/sizeof(float)), int64_t(norm->nb[1]/sizeof(float)), ggml_get_op_params_f32(dst, 0));
+            if (images) {
+                ggml_cuda_kernel_launch(mul_mat_vec_f_hc_packed_images<T, Acc, Block>, params,
+                    (const T *) weight->data, (const float *) input->data, (const float *) norm->data, (float *) mm->data, (float *) dst->data,
+                    int(weight->ne[0]/2), int(weight->nb[1]/sizeof(T)), int(norm->ne[0]), int(norm->ne[1]),
+                    int64_t(norm->nb[0]/sizeof(float)), int64_t(norm->nb[1]/sizeof(float)), ggml_get_op_params_f32(dst, 0), *images);
+            } else {
+                ggml_cuda_kernel_launch(mul_mat_vec_f_hc_packed_rows<T, Acc, Block>, params,
+                    (const T *) weight->data, (const float *) input->data, (const float *) norm->data, (float *) mm->data, (float *) dst->data,
+                    int(weight->ne[0]/2), int(weight->nb[1]/sizeof(T)), int(norm->ne[0]), int(norm->ne[1]),
+                    int64_t(norm->nb[0]/sizeof(float)), int64_t(norm->nb[1]/sizeof(float)), ggml_get_op_params_f32(dst, 0));
+            }
             return;
         }
     }
     auto kernel = mul_mat_vec_f_hc_pre<T, Acc, Columns, Block>;
     const int shared = ggml_cuda_info().devices[ctx.device].warp_size*sizeof(float);
     const ggml_cuda_kernel_launch_params params = {dim3(norm->ne[0], 1, 1), dim3(Block, 1, 1), shared, ctx.stream()};
-    ggml_cuda_kernel_launch(kernel, params,
-        (const T *) weight->data, (const float *) input->data, (const float *) norm->data, (float *) mm->data, (float *) dst->data,
-        int(weight->ne[0]/2), int(weight->nb[1]/sizeof(T)), int(input->nb[1]/(2*sizeof(float))), int(mm->nb[1]/sizeof(float)),
-        int(norm->ne[0]), int(norm->ne[1]), int64_t(norm->nb[0]/sizeof(float)), int64_t(norm->nb[1]/sizeof(float)),
-        int64_t(norm->nb[2]/sizeof(float)), int64_t(dst->nb[1]/sizeof(float)), ggml_get_op_params_f32(dst, 0));
+    if (images) {
+        ggml_cuda_kernel_launch(mul_mat_vec_f_hc_images<T, Acc, Columns, Block>, params,
+            (const T *) weight->data, (const float *) input->data, (const float *) norm->data, (float *) mm->data, (float *) dst->data,
+            int(weight->ne[0]/2), int(weight->nb[1]/sizeof(T)), int(input->nb[1]/(2*sizeof(float))), int(mm->nb[1]/sizeof(float)),
+            int(norm->ne[0]), int(norm->ne[1]), int64_t(norm->nb[0]/sizeof(float)), int64_t(norm->nb[1]/sizeof(float)),
+            int64_t(norm->nb[2]/sizeof(float)), int64_t(dst->nb[1]/sizeof(float)), ggml_get_op_params_f32(dst, 0), *images);
+    } else {
+        ggml_cuda_kernel_launch(kernel, params,
+            (const T *) weight->data, (const float *) input->data, (const float *) norm->data, (float *) mm->data, (float *) dst->data,
+            int(weight->ne[0]/2), int(weight->nb[1]/sizeof(T)), int(input->nb[1]/(2*sizeof(float))), int(mm->nb[1]/sizeof(float)),
+            int(norm->ne[0]), int(norm->ne[1]), int64_t(norm->nb[0]/sizeof(float)), int64_t(norm->nb[1]/sizeof(float)),
+            int64_t(norm->nb[2]/sizeof(float)), int64_t(dst->nb[1]/sizeof(float)), ggml_get_op_params_f32(dst, 0));
+    }
 }
 
 template <typename T, typename Acc, int Columns>
-static void ggml_cuda_mmvf_hc_blocks(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * dst) {
+static void ggml_cuda_mmvf_hc_blocks(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data * images) {
     switch (ggml_cuda_mmvf_hc_block_size(mm->src[0]->ne[0], ctx.device)) {
-        case 32: ggml_cuda_mmvf_hc_launch<T, Acc, Columns, 32>(ctx, mm, dst); break;
-        case 64: ggml_cuda_mmvf_hc_launch<T, Acc, Columns, 64>(ctx, mm, dst); break;
-        case 96: ggml_cuda_mmvf_hc_launch<T, Acc, Columns, 96>(ctx, mm, dst); break;
-        case 128: ggml_cuda_mmvf_hc_launch<T, Acc, Columns, 128>(ctx, mm, dst); break;
-        case 160: ggml_cuda_mmvf_hc_launch<T, Acc, Columns, 160>(ctx, mm, dst); break;
-        case 192: ggml_cuda_mmvf_hc_launch<T, Acc, Columns, 192>(ctx, mm, dst); break;
-        case 224: ggml_cuda_mmvf_hc_launch<T, Acc, Columns, 224>(ctx, mm, dst); break;
-        case 256: ggml_cuda_mmvf_hc_launch<T, Acc, Columns, 256>(ctx, mm, dst); break;
+        case 32: ggml_cuda_mmvf_hc_launch<T, Acc, Columns, 32>(ctx, mm, dst, images); break;
+        case 64: ggml_cuda_mmvf_hc_launch<T, Acc, Columns, 64>(ctx, mm, dst, images); break;
+        case 96: ggml_cuda_mmvf_hc_launch<T, Acc, Columns, 96>(ctx, mm, dst, images); break;
+        case 128: ggml_cuda_mmvf_hc_launch<T, Acc, Columns, 128>(ctx, mm, dst, images); break;
+        case 160: ggml_cuda_mmvf_hc_launch<T, Acc, Columns, 160>(ctx, mm, dst, images); break;
+        case 192: ggml_cuda_mmvf_hc_launch<T, Acc, Columns, 192>(ctx, mm, dst, images); break;
+        case 224: ggml_cuda_mmvf_hc_launch<T, Acc, Columns, 224>(ctx, mm, dst, images); break;
+        case 256: ggml_cuda_mmvf_hc_launch<T, Acc, Columns, 256>(ctx, mm, dst, images); break;
         default: GGML_ABORT("unsupported MMVF block size");
     }
 }
 
 template <typename T, typename Acc>
-static void ggml_cuda_mmvf_hc_columns(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * dst) {
+static void ggml_cuda_mmvf_hc_columns(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data * images) {
     switch (mm->ne[1]) {
-        case 1: ggml_cuda_mmvf_hc_blocks<T, Acc, 1>(ctx, mm, dst); break;
-        case 2: ggml_cuda_mmvf_hc_blocks<T, Acc, 2>(ctx, mm, dst); break;
-        case 3: ggml_cuda_mmvf_hc_blocks<T, Acc, 3>(ctx, mm, dst); break;
-        case 4: ggml_cuda_mmvf_hc_blocks<T, Acc, 4>(ctx, mm, dst); break;
-        case 5: ggml_cuda_mmvf_hc_blocks<T, Acc, 5>(ctx, mm, dst); break;
-        case 6: ggml_cuda_mmvf_hc_blocks<T, Acc, 6>(ctx, mm, dst); break;
-        case 7: ggml_cuda_mmvf_hc_blocks<T, Acc, 7>(ctx, mm, dst); break;
-        case 8: ggml_cuda_mmvf_hc_blocks<T, Acc, 8>(ctx, mm, dst); break;
+        case 1: ggml_cuda_mmvf_hc_blocks<T, Acc, 1>(ctx, mm, dst, images); break;
+        case 2: ggml_cuda_mmvf_hc_blocks<T, Acc, 2>(ctx, mm, dst, images); break;
+        case 3: ggml_cuda_mmvf_hc_blocks<T, Acc, 3>(ctx, mm, dst, images); break;
+        case 4: ggml_cuda_mmvf_hc_blocks<T, Acc, 4>(ctx, mm, dst, images); break;
+        case 5: ggml_cuda_mmvf_hc_blocks<T, Acc, 5>(ctx, mm, dst, images); break;
+        case 6: ggml_cuda_mmvf_hc_blocks<T, Acc, 6>(ctx, mm, dst, images); break;
+        case 7: ggml_cuda_mmvf_hc_blocks<T, Acc, 7>(ctx, mm, dst, images); break;
+        case 8: ggml_cuda_mmvf_hc_blocks<T, Acc, 8>(ctx, mm, dst, images); break;
         default: GGML_ABORT("unsupported MMVF column count");
     }
 }
 
-void ggml_cuda_mul_mat_vec_f_hc_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * dst) {
+void ggml_cuda_mul_mat_vec_f_hc_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data * images) {
     const auto type = mm->src[0]->type;
     const auto prec = fast_fp16_available(ggml_cuda_info().devices[ctx.device].cc) ? ggml_prec(mm->op_params[0]) : GGML_PREC_F32;
     if (type == GGML_TYPE_F32) {
-        ggml_cuda_mmvf_hc_columns<float, float>(ctx, mm, dst);
+        ggml_cuda_mmvf_hc_columns<float, float>(ctx, mm, dst, images);
     } else if (type == GGML_TYPE_F16 && prec == GGML_PREC_DEFAULT) {
-        ggml_cuda_mmvf_hc_columns<half, half>(ctx, mm, dst);
+        ggml_cuda_mmvf_hc_columns<half, half>(ctx, mm, dst, images);
     } else if (type == GGML_TYPE_F16) {
-        ggml_cuda_mmvf_hc_columns<half, float>(ctx, mm, dst);
+        ggml_cuda_mmvf_hc_columns<half, float>(ctx, mm, dst, images);
     } else if (type == GGML_TYPE_BF16) {
-        ggml_cuda_mmvf_hc_columns<nv_bfloat16, float>(ctx, mm, dst);
+        ggml_cuda_mmvf_hc_columns<nv_bfloat16, float>(ctx, mm, dst, images);
     } else {
         GGML_ABORT("unsupported MMVF type");
     }

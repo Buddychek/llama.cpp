@@ -13,7 +13,8 @@ void ggml_cuda_op_mul_mat_vec_f(
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);
 
-void ggml_cuda_mul_mat_vec_f_hc_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * dst);
+struct ggml_cuda_hc_pre_emit_data;
+void ggml_cuda_mul_mat_vec_f_hc_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data * images = nullptr);
 
 bool ggml_cuda_should_fuse_hc_up(const ggml_tensor * weight, const ggml_tensor * norm, int device);
 
