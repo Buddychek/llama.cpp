@@ -23,6 +23,12 @@ struct ggml_cuda_hc_pre_q8_emit_data {
     int64_t padded;
 };
 
-void ggml_cuda_op_dsv4_hc_pre_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * weights, ggml_tensor * mm, ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data * images = nullptr, const ggml_cuda_hc_pre_q8_emit_data * q8 = nullptr);
+struct ggml_cuda_hc_pre_mmq_emit_data {
+    void * data;
+    int64_t padded;
+    int layout;
+};
+
+void ggml_cuda_op_dsv4_hc_pre_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * weights, ggml_tensor * mm, ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data * images = nullptr, const ggml_cuda_hc_pre_q8_emit_data * q8 = nullptr, const ggml_cuda_hc_pre_mmq_emit_data * mmq = nullptr);
 
 void ggml_cuda_op_dsv4_hc_pre_mmq(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * image, int64_t padded, int layout, const ggml_cuda_hc_pre_emit_data & images);

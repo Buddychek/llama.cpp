@@ -464,12 +464,20 @@ void ggml_cuda_op_dsv4_hc_pre_q8(ggml_backend_cuda_context & ctx, ggml_tensor * 
     else { ggml_cuda_hc_pre_q8_launch<false>(ctx, dst, image, cols, padded, images); }
 }
 
-void ggml_cuda_op_dsv4_hc_pre_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * weights, ggml_tensor * mm, ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data * images, const ggml_cuda_hc_pre_q8_emit_data * q8) {
+static void ggml_cuda_hc_pre_convert_mmq(ggml_backend_cuda_context & ctx, ggml_type type, const void * weights,
+        ggml_tensor * mm, ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data * images, const ggml_cuda_hc_pre_mmq_emit_data & mmq);
+
+void ggml_cuda_op_dsv4_hc_pre_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * weights, ggml_tensor * mm, ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data * images, const ggml_cuda_hc_pre_q8_emit_data * q8, const ggml_cuda_hc_pre_mmq_emit_data * mmq) {
     const ggml_tensor * x = dst->src[0];
     const ggml_tensor * view = dst->src[1];
     GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_BF16);
     GGML_ASSERT(x->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_get_op_params_i32(dst, 1) && ggml_is_contiguous(mm) && ggml_is_contiguous(view));
+
+    if (mmq) {
+        ggml_cuda_hc_pre_convert_mmq(ctx, type, weights, mm, dst, images, *mmq);
+        return;
+    }
 
     const int64_t nr = x->ne[0]*x->ne[2];
     const dim3 block_dims(256, 1, 1);
@@ -555,9 +563,9 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
 }
 
-template <mmq_q8_1_ds_layout Layout, bool Gated>
-static __global__ void dsv4_hc_pre_mmq(
-        const float * x, const float * weights, float * dst, int64_t cols, int64_t hc,
+template <mmq_q8_1_ds_layout Layout, bool Gated, typename Gate>
+static __device__ __forceinline__ void dsv4_hc_pre_mmq_impl(
+        const float * x, const Gate weights, float * dst, int64_t cols, int64_t hc,
         int64_t sx0, int64_t sx1, int64_t sx2, int64_t sw0, int64_t sw1, int64_t sw2,
         int64_t sd0, int64_t sd1, float scale, block_q8_1_mmq * image, int64_t padded, int64_t rows,
         ggml_cuda_hc_pre_emit_data images) {
@@ -567,7 +575,7 @@ static __global__ void dsv4_hc_pre_mmq(
     ggml_cuda_pdl_sync();
     float value = 0.0f;
     if (column < cols) {
-        value = scale*dsv4_hc_pre_sum<Gated>(x, ggml_cuda_hc_gate_f32{weights}, column, row, hc, sx0, sx1, sx2, sw0, sw1, sw2);
+        value = scale*dsv4_hc_pre_sum<Gated>(x, weights, column, row, hc, sx0, sx1, sx2, sw0, sw1, sw2);
         dst[column*sd0 + row*sd1] = value;
         if (images.f16) { ((half *) images.f16)[row*cols + column] = ggml_cuda_cast<half>(value); }
         if (images.bf16) { ((nv_bfloat16 *) images.bf16)[row*cols + column] = ggml_cuda_cast<nv_bfloat16>(value); }
@@ -625,6 +633,26 @@ static __global__ void dsv4_hc_pre_mmq(
     }
 }
 
+template <mmq_q8_1_ds_layout Layout, bool Gated>
+static __global__ void dsv4_hc_pre_mmq(
+        const float * x, const float * weights, float * dst, int64_t cols, int64_t hc,
+        int64_t sx0, int64_t sx1, int64_t sx2, int64_t sw0, int64_t sw1, int64_t sw2,
+        int64_t sd0, int64_t sd1, float scale, block_q8_1_mmq * image, int64_t padded, int64_t rows,
+        ggml_cuda_hc_pre_emit_data images) {
+    dsv4_hc_pre_mmq_impl<Layout, Gated>(x, ggml_cuda_hc_gate_f32{weights}, dst, cols, hc,
+        sx0, sx1, sx2, sw0, sw1, sw2, sd0, sd1, scale, image, padded, rows, images);
+}
+
+template <mmq_q8_1_ds_layout Layout, typename T>
+static __global__ void dsv4_hc_pre_convert_mmq(
+        const float * x, const void * weights, float * raw, float * dst, int64_t cols, int64_t hc,
+        int64_t sx0, int64_t sx1, int64_t sx2, int64_t sw0, int64_t sw1, int64_t sw2,
+        int64_t sd0, int64_t sd1, float scale, block_q8_1_mmq * image, int64_t padded, int64_t rows,
+        ggml_cuda_hc_pre_emit_data images) {
+    dsv4_hc_pre_mmq_impl<Layout, true>(x, ggml_cuda_hc_gate_convert<T>{(const T *) weights, raw}, dst, cols, hc,
+        sx0, sx1, sx2, sw0, sw1, sw2, sd0, sd1, scale, image, padded, rows, images);
+}
+
 template <mmq_q8_1_ds_layout Layout>
 static void ggml_cuda_hc_pre_mmq_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * image, int64_t padded, const ggml_cuda_hc_pre_emit_data & images) {
     const ggml_tensor * x = dst->src[0], * weights = dst->src[1];
@@ -643,6 +671,35 @@ void ggml_cuda_op_dsv4_hc_pre_mmq(ggml_backend_cuda_context & ctx, ggml_tensor *
         case MMQ_Q8_1_DS_LAYOUT_D4: ggml_cuda_hc_pre_mmq_launch<MMQ_Q8_1_DS_LAYOUT_D4>(ctx, dst, image, padded, images); break;
         case MMQ_Q8_1_DS_LAYOUT_DS4: ggml_cuda_hc_pre_mmq_launch<MMQ_Q8_1_DS_LAYOUT_DS4>(ctx, dst, image, padded, images); break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6: ggml_cuda_hc_pre_mmq_launch<MMQ_Q8_1_DS_LAYOUT_D2S6>(ctx, dst, image, padded, images); break;
+        default: GGML_ABORT("invalid HC MMQ layout");
+    }
+}
+
+template <mmq_q8_1_ds_layout Layout>
+static void ggml_cuda_hc_pre_convert_mmq_launch(ggml_backend_cuda_context & ctx, ggml_type type, const void * weights,
+        ggml_tensor * mm, ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data * images, const ggml_cuda_hc_pre_mmq_emit_data & mmq) {
+    const ggml_tensor * x = dst->src[0], * view = dst->src[1];
+    const int block = CUDA_QUANTIZE_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params params(dim3((dst->ne[0] + block - 1)/block, dst->ne[1]), dim3(block), 0, ctx.stream());
+    const auto launch = [&](auto tag) {
+        using T = decltype(tag);
+        ggml_cuda_kernel_launch(dsv4_hc_pre_convert_mmq<Layout, T>, params,
+            (const float *) x->data, weights, (float *) mm->data, (float *) dst->data,
+            dst->ne[0], x->ne[1], int64_t(x->nb[0]/4), int64_t(x->nb[1]/4), int64_t(x->nb[2]/4),
+            int64_t(view->nb[0]/4), int64_t(view->nb[1]/4), int64_t(view->nb[2]/4),
+            int64_t(dst->nb[0]/4), int64_t(dst->nb[1]/4), ggml_get_op_params_f32(dst, 0),
+            (block_q8_1_mmq *) mmq.data, mmq.padded, dst->ne[1], images ? *images : ggml_cuda_hc_pre_emit_data{});
+    };
+    if (type == GGML_TYPE_F16) { launch(half{}); }
+    else { GGML_ASSERT(type == GGML_TYPE_BF16); launch(nv_bfloat16{}); }
+}
+
+static void ggml_cuda_hc_pre_convert_mmq(ggml_backend_cuda_context & ctx, ggml_type type, const void * weights,
+        ggml_tensor * mm, ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data * images, const ggml_cuda_hc_pre_mmq_emit_data & mmq) {
+    switch (mmq.layout) {
+        case MMQ_Q8_1_DS_LAYOUT_D4: ggml_cuda_hc_pre_convert_mmq_launch<MMQ_Q8_1_DS_LAYOUT_D4>(ctx, type, weights, mm, dst, images, mmq); break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4: ggml_cuda_hc_pre_convert_mmq_launch<MMQ_Q8_1_DS_LAYOUT_DS4>(ctx, type, weights, mm, dst, images, mmq); break;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6: ggml_cuda_hc_pre_convert_mmq_launch<MMQ_Q8_1_DS_LAYOUT_D2S6>(ctx, type, weights, mm, dst, images, mmq); break;
         default: GGML_ABORT("invalid HC MMQ layout");
     }
 }

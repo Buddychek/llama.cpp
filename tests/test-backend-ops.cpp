@@ -4582,7 +4582,7 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
             ggml_set_output(out);
             auto * weights = ggml_new_tensor_2d(ctx, consumer_type, n_embd, 129);
             auto * reader = ggml_mul_mat(ctx, weights, out);
-            stages = {out, reader};
+            stages = projection ? std::vector<ggml_tensor *>{projection, out, reader} : std::vector<ggml_tensor *>{out, reader};
             return reader;
         }
         if (reader_types) {
@@ -9583,6 +9583,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(64, 1, 17, false, GGML_TYPE_COUNT, false, false, false, 127, 0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_dsv4_hc_pre(768, 5, 17, true, GGML_TYPE_COUNT, false, false, false, 127, 0, GGML_TYPE_Q2_K));
     test_cases.emplace_back(new test_dsv4_hc_pre(576, 33, 65, false, GGML_TYPE_COUNT, false, false, false, 127, 0, GGML_TYPE_Q4_0));
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q2_K}) {
+        for (bool computed : {false, true}) {
+            test_cases.emplace_back(new test_dsv4_hc_pre(512, 3, 17, true, GGML_TYPE_F16, computed, false, false, 318, 0, type));
+        }
+    }
+    test_cases.emplace_back(new test_dsv4_hc_pre(512, 3, 17, true, GGML_TYPE_F16, false, false, false, 318, 7));
+    test_cases.emplace_back(new test_dsv4_hc_pre(768, 5, 33, true, GGML_TYPE_F16, false, false, false, 62, 0, GGML_TYPE_Q2_K));
+    test_cases.emplace_back(new test_dsv4_hc_pre(576, 33, 17, true, GGML_TYPE_F16, false, false, false, 62, 0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_dsv4_hc_pre(1, 4, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17));
     test_cases.emplace_back(new test_dsv4_hc_pre(128, 4, 257));
