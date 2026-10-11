@@ -68,4 +68,4 @@ void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tens
 
 void ggml_cuda_op_rms_norm_mmq_multi(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * add, ggml_tensor * scale, void * const images[3], int64_t cols, int64_t padded, int64_t rows);
 
-void ggml_cuda_op_hc_post_norm_emit_mmq_multi(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * scale, void * f16, void * bf16, void * const images[3], int64_t cols, int64_t padded, int64_t rows);
+void ggml_cuda_op_hc_post_norm_emit_mmq_multi(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * scale, void * f16, void * bf16, void * const images[3], int64_t cols, int64_t padded, int64_t rows, bool banked = false);

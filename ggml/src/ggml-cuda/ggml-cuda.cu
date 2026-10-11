@@ -4398,7 +4398,7 @@ static std::vector<ggml_cuda_norm_mmq_match> ggml_cuda_plan_norm_mmq(ggml_cgraph
             const auto & primary = reuse.groups[match.image];
             const ggml_tensor * shape = graph->nodes[primary.node]->src[1];
             const int primary_key = keys[primary.node];
-            if (primary_key >= 0 && primary_key <= 2 && shape->ne[2] == 1 && shape->ne[3] == 1) {
+            if (primary_key >= 0 && primary_key <= 2 && ((shape->ne[2] == 1 && shape->ne[3] == 1) || (match.post && shape->ne[0] >= 256))) {
                 match.images[primary_key] = match.image;
                 if (found != readers.end()) {
                     for (const int node : found->second) {
@@ -7112,7 +7112,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             launch_affine_emit(data);
                         } else if (count > 1) {
                             ggml_cuda_op_hc_post_norm_emit_mmq_multi(*cuda_ctx, emit.post, emit.norm, emit.mul, emit.scale,
-                                f16, bf16, images, input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), input->ne[1]);
+                                f16, bf16, images, input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), input->ne[1], input->ne[2] != 1 || input->ne[3] != 1);
                         } else {
                             ggml_cuda_op_hc_post_norm_emit_mmq(*cuda_ctx, emit.post, emit.norm, emit.mul, emit.scale, f16, bf16,
                                 mmq_inputs[g].quantized.get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), input->ne[1], mmq_keys[reader], input->ne[2] != 1 || input->ne[3] != 1);

@@ -1585,6 +1585,66 @@ struct ggml_cuda_hc_norm_mmq_bundle_store {
     }
 };
 
+template <bool Scale>
+struct ggml_cuda_hc_norm_banked_bundle_store {
+    static constexpr int width = 4;
+    ggml_cuda_hc_norm_mmq_bundle_store<Scale> write;
+    uint3 rows;
+
+    template <mmq_q8_1_ds_layout Layout>
+    __device__ __forceinline__ void emit(block_q8_1_mmq * image, uint2 rc, float4 value) const {
+        constexpr int group = Layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
+        const ggml_cuda_norm_mmq_store<Layout> store = {image, write.cols.z, write.padded, write.rows};
+        store.store(rc.y, rc.x, value);
+        if (rc.y >= write.cols.z - group) {
+            for (int64_t tail = write.cols.z; tail < write.padded; tail += group) {
+                const int64_t column = tail + rc.y % group;
+                const int64_t ib = (column/QK8_1_MMQ)*write.rows + rc.x;
+                ((char4 *) image[ib].qs)[(column % QK8_1_MMQ)/4] = make_char4(0, 0, 0, 0);
+                const int iqs = column % QK8_1_MMQ;
+                if constexpr (Layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+                    if (iqs % 16 == 0 && iqs < 96) {
+                        image[ib].d2s6[2 + iqs/16] = 0.0f;
+                        if (iqs % 64 == 0) { image[ib].d2s6[iqs/64] = 0.0f; }
+                    }
+                } else if (iqs % 32 == 0) {
+                    if constexpr (Layout == MMQ_Q8_1_DS_LAYOUT_DS4) { image[ib].ds4[iqs/32] = make_half2(0.0f, 0.0f); }
+                    else { image[ib].d4[iqs/32] = 0.0f; }
+                }
+            }
+        }
+    }
+
+    __device__ __forceinline__ void operator()(float * dst, const float * base, int col, float4 value) const {
+        if constexpr (Scale) {
+            value.x = write.scale * value.x; value.y = write.scale * value.y;
+            value.z = write.scale * value.z; value.w = write.scale * value.w;
+        }
+        dst[col] = value.x; dst[col + 1] = value.y;
+        dst[col + 2] = value.z; dst[col + 3] = value.w;
+        const int64_t index = dst - base + col;
+        const uint2 rc = fast_div_modulo(uint32_t(index), write.cols);
+        const uint2 bank_row = fast_div_modulo(rc.x, rows);
+        const int64_t offset = int64_t(bank_row.x)*(write.padded/QK8_1_MMQ)*rows.z;
+        const uint2 local = make_uint2(bank_row.y, rc.y);
+        if (write.images[0]) { emit<MMQ_Q8_1_DS_LAYOUT_D4>(write.images[0] + offset, local, value); }
+        if (write.images[1]) { emit<MMQ_Q8_1_DS_LAYOUT_DS4>(write.images[1] + offset, local, value); }
+        if (write.images[2]) { emit<MMQ_Q8_1_DS_LAYOUT_D2S6>(write.images[2] + offset, local, value); }
+        if (write.f16) {
+            write.f16[index] = ggml_cuda_cast<half>(value.x);
+            write.f16[index + 1] = ggml_cuda_cast<half>(value.y);
+            write.f16[index + 2] = ggml_cuda_cast<half>(value.z);
+            write.f16[index + 3] = ggml_cuda_cast<half>(value.w);
+        }
+        if (write.bf16) {
+            write.bf16[index] = ggml_cuda_cast<nv_bfloat16>(value.x);
+            write.bf16[index + 1] = ggml_cuda_cast<nv_bfloat16>(value.y);
+            write.bf16[index + 2] = ggml_cuda_cast<nv_bfloat16>(value.z);
+            write.bf16[index + 3] = ggml_cuda_cast<nv_bfloat16>(value.w);
+        }
+    }
+};
+
 struct hc_post_norm_data {
     const float * x;
     const float * residual;
@@ -1687,7 +1747,22 @@ static __device__ __forceinline__ void hc_post_norm_f32_impl(hc_post_norm_data a
     tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
     const float mean = tmp / a.ncols;
     const float scale = rsqrtf(mean + a.eps);
-    if constexpr (Write::width == 2) {
+    if constexpr (Write::width == 4) {
+        for (int64_t col = 4*threadIdx.x; col < a.ncols; col += 4*block_size) {
+            float4 value;
+            if constexpr (do_multiply) {
+                value = make_float4(
+                    scale * a.post_dst[offset + col] * a.mul[fastmodulo(col, a.mul_ne[0])],
+                    scale * a.post_dst[offset + col + 1] * a.mul[fastmodulo(col + 1, a.mul_ne[0])],
+                    scale * a.post_dst[offset + col + 2] * a.mul[fastmodulo(col + 2, a.mul_ne[0])],
+                    scale * a.post_dst[offset + col + 3] * a.mul[fastmodulo(col + 3, a.mul_ne[0])]);
+            } else {
+                value = make_float4(scale * a.post_dst[offset + col], scale * a.post_dst[offset + col + 1],
+                    scale * a.post_dst[offset + col + 2], scale * a.post_dst[offset + col + 3]);
+            }
+            write(a.dst + offset, a.dst, int(col), value);
+        }
+    } else if constexpr (Write::width == 2) {
         for (int64_t col = 2*threadIdx.x; col < a.ncols; col += 2*block_size) {
             float x, y;
             if constexpr (do_multiply) {
@@ -1740,9 +1815,18 @@ static __global__ __launch_bounds__(Block) void hc_post_norm_emit_mmq_multi_f32(
     hc_post_norm_f32_impl<Block, Comb, Multiply, NormLayout>(a, write);
 }
 
+template <int Block, bool Comb, bool Multiply, bool Scale, int NormLayout>
+static __global__ __launch_bounds__(Block) void hc_post_norm_emit_banked_mmq_multi_f32(hc_post_norm_data a, ggml_cuda_hc_norm_banked_bundle_store<Scale> write) {
+    hc_post_norm_f32_impl<Block, Comb, Multiply, NormLayout>(a, write);
+}
+
 template <mmq_q8_1_ds_layout Layout, int Block, bool Comb, bool Multiply, bool Scale, bool Banked = false, bool Multi = false>
 static auto hc_post_norm_emit_mmq_kernel(int layout) {
-    if constexpr (Multi) {
+    if constexpr (Multi && Banked) {
+        if (layout == 1) { return hc_post_norm_emit_banked_mmq_multi_f32<Block, Comb, Multiply, Scale, 1>; }
+        if (layout == 2) { return hc_post_norm_emit_banked_mmq_multi_f32<Block, Comb, Multiply, Scale, 2>; }
+        return hc_post_norm_emit_banked_mmq_multi_f32<Block, Comb, Multiply, Scale, 0>;
+    } else if constexpr (Multi) {
         if (layout == 1) { return hc_post_norm_emit_mmq_multi_f32<Block, Comb, Multiply, Scale, 1>; }
         if (layout == 2) { return hc_post_norm_emit_mmq_multi_f32<Block, Comb, Multiply, Scale, 2>; }
         return hc_post_norm_emit_mmq_multi_f32<Block, Comb, Multiply, Scale, 0>;
@@ -2234,7 +2318,9 @@ static void ggml_cuda_hc_post_norm_emit_mmq_dispatch(ggml_backend_cuda_context &
             const ggml_cuda_hc_norm_mmq_bundle_store<decltype(scaled)::value> write = {
                 {(block_q8_1_mmq *) images[0], (block_q8_1_mmq *) images[1], (block_q8_1_mmq *) images[2]},
                 init_fastdiv_values(cols), padded, rows, (half *) f16, (nv_bfloat16 *) bf16, factor};
-            ggml_cuda_kernel_launch(kernel, launch, a, write);
+            if constexpr (Banked) {
+                ggml_cuda_kernel_launch(kernel, launch, a, ggml_cuda_hc_norm_banked_bundle_store<decltype(scaled)::value>{write, init_fastdiv_values(rows)});
+            } else { ggml_cuda_kernel_launch(kernel, launch, a, write); }
         } else if constexpr (Banked) { ggml_cuda_kernel_launch(kernel, launch, a, (half *) f16, (nv_bfloat16 *) bf16, image, init_fastdiv_values(cols), padded, init_fastdiv_values(rows), factor); }
         else { ggml_cuda_kernel_launch(kernel, launch, a, (half *) f16, (nv_bfloat16 *) bf16, image, init_fastdiv_values(cols), padded, rows, factor); }
     };
@@ -2271,7 +2357,12 @@ void ggml_cuda_op_hc_post_norm_emit_mmq(ggml_backend_cuda_context & ctx, ggml_te
 
 void ggml_cuda_op_hc_post_norm_emit_mmq_multi(ggml_backend_cuda_context & ctx, ggml_tensor * post,
         ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * scale, void * f16, void * bf16,
-        void * const images[3], int64_t cols, int64_t padded, int64_t rows) {
+        void * const images[3], int64_t cols, int64_t padded, int64_t rows, bool banked) {
+    if (banked) {
+        ggml_cuda_hc_post_norm_emit_mmq_dispatch<MMQ_Q8_1_DS_LAYOUT_D4, true, true>(
+            ctx, post, norm, mul, scale, f16, bf16, nullptr, cols, padded, rows, images);
+        return;
+    }
     ggml_cuda_hc_post_norm_emit_mmq_dispatch<MMQ_Q8_1_DS_LAYOUT_D4, false, true>(
         ctx, post, norm, mul, scale, f16, bf16, nullptr, cols, padded, rows, images);
 }
@@ -2661,7 +2752,22 @@ static __device__ __forceinline__ void hc_injection_norm_emit_impl(hc_post_norm_
     tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
     const float mean = tmp / a.ncols;
     const float scale = rsqrtf(mean + a.eps);
-    if constexpr (Write::width == 2) {
+    if constexpr (Write::width == 4) {
+        for (int64_t col = 4*threadIdx.x; col < a.ncols; col += 4*block_size) {
+            float4 value;
+            if constexpr (do_multiply) {
+                value = make_float4(
+                    scale * a.post_dst[offset + col] * a.mul[fastmodulo(col, a.mul_ne[0])],
+                    scale * a.post_dst[offset + col + 1] * a.mul[fastmodulo(col + 1, a.mul_ne[0])],
+                    scale * a.post_dst[offset + col + 2] * a.mul[fastmodulo(col + 2, a.mul_ne[0])],
+                    scale * a.post_dst[offset + col + 3] * a.mul[fastmodulo(col + 3, a.mul_ne[0])]);
+            } else {
+                value = make_float4(scale * a.post_dst[offset + col], scale * a.post_dst[offset + col + 1],
+                    scale * a.post_dst[offset + col + 2], scale * a.post_dst[offset + col + 3]);
+            }
+            write(a.dst + offset, a.dst, int(col), value);
+        }
+    } else if constexpr (Write::width == 2) {
         for (int64_t col = 2*threadIdx.x; col < a.ncols; col += 2*block_size) {
             float x, y;
             if constexpr (do_multiply) {
@@ -2785,11 +2891,12 @@ void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tens
         void * f16 = emit ? emit->f16 : nullptr;
         void * bf16 = emit ? emit->bf16 : nullptr;
         if (emit && (emit->mmq_images[0] || emit->mmq_images[1] || emit->mmq_images[2])) {
-            GGML_ASSERT(!emit->banked);
             const ggml_cuda_hc_norm_mmq_bundle_store<true> write = {
                 {(block_q8_1_mmq *) emit->mmq_images[0], (block_q8_1_mmq *) emit->mmq_images[1], (block_q8_1_mmq *) emit->mmq_images[2]},
                 init_fastdiv_values(emit->cols), emit->padded, emit->rows, (half *) f16, (nv_bfloat16 *) bf16, factor};
-            ggml_cuda_hc_affine_emit_launch<false>(ctx, a, g, norm, comb, false, write);
+            if (emit->banked) {
+                ggml_cuda_hc_affine_emit_launch<false>(ctx, a, g, norm, comb, false, ggml_cuda_hc_norm_banked_bundle_store<true>{write, init_fastdiv_values(emit->rows)});
+            } else { ggml_cuda_hc_affine_emit_launch<false>(ctx, a, g, norm, comb, false, write); }
         } else if (emit && emit->mmq) {
             const uint3 cols = init_fastdiv_values(emit->cols);
             const auto launch = [&](auto write) {
@@ -2814,11 +2921,12 @@ void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tens
         GGML_ASSERT(norm);
         const uint3 cols = init_fastdiv_values(emit->cols);
         if (emit->mmq_images[0] || emit->mmq_images[1] || emit->mmq_images[2]) {
-            GGML_ASSERT(!emit->banked);
             const ggml_cuda_hc_norm_mmq_bundle_store<false> write = {
                 {(block_q8_1_mmq *) emit->mmq_images[0], (block_q8_1_mmq *) emit->mmq_images[1], (block_q8_1_mmq *) emit->mmq_images[2]},
                 cols, emit->padded, emit->rows, (half *) emit->f16, (nv_bfloat16 *) emit->bf16, 1.0f};
-            ggml_cuda_hc_affine_emit_launch(ctx, a, g, norm, comb, mul, write);
+            if (emit->banked) {
+                ggml_cuda_hc_affine_emit_launch(ctx, a, g, norm, comb, mul, ggml_cuda_hc_norm_banked_bundle_store<false>{write, init_fastdiv_values(emit->rows)});
+            } else { ggml_cuda_hc_affine_emit_launch(ctx, a, g, norm, comb, mul, write); }
         } else if (emit->mmq) {
             const auto launch_mmq = [&](auto write) {
                 if (emit->banked) { ggml_cuda_hc_affine_emit_launch(ctx, a, g, norm, comb, mul, ggml_cuda_hc_norm_banked_pair_store<decltype(write)>{write, init_fastdiv_values(emit->rows)}); }
