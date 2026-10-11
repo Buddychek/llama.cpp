@@ -4232,25 +4232,28 @@ struct test_mul_mat_unary : public test_case {
     const bool affine;
     const bool window;
     const bool second_post;
+    const int64_t columns;
+    const std::array<int64_t, 2> pair_rows;
     std::vector<ggml_tensor *> stages;
     ggml_tensor * weights = nullptr;
     ggml_tensor * input = nullptr;
+    ggml_tensor * second_weights = nullptr;
 
-    test_mul_mat_unary(ggml_type weight_type, ggml_unary_op op, bool before, bool after, bool batched, bool affine = false, bool window = false, bool second_post = false)
-        : weight_type(weight_type), op(op), before(before), after(after), batched(batched), affine(affine), window(window), second_post(second_post) {}
+    test_mul_mat_unary(ggml_type weight_type, ggml_unary_op op, bool before, bool after, bool batched, bool affine = false, bool window = false, bool second_post = false, int64_t columns = 0, std::array<int64_t, 2> pair_rows = {33, 32})
+        : weight_type(weight_type), op(op), before(before), after(after), batched(batched), affine(affine), window(window), second_post(second_post), columns(columns), pair_rows(pair_rows) {}
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_UNARY";
     }
 
-    std::string vars() override { return VARS_TO_STR8(weight_type, op, before, after, batched, affine, window, second_post); }
+    std::string vars() override { return VARS_TO_STR8(weight_type, op, before, after, batched, affine, window, second_post) + (columns ? "," + VARS_TO_STR2(columns, pair_rows) : ""); }
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return stages; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        weights = ggml_new_tensor_4d(ctx, weight_type, 127, 129, batched ? 2 : 1, 1);
-        input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 127, 17, batched ? 2 : 1, 1);
+        weights = ggml_new_tensor_4d(ctx, weight_type, columns ? 256 : 127, columns ? pair_rows[0] : 129, batched ? 2 : 1, 1);
+        input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, columns ? 256 : 127, columns ? columns : 17, batched ? 2 : 1, 1);
         ggml_tensor * out = ggml_mul_mat(ctx, weights, input);
         stages = {out};
         if (window) {
@@ -4276,6 +4279,17 @@ struct test_mul_mat_unary : public test_case {
             stages.push_back(out);
         }
         for (ggml_tensor * stage : stages) { ggml_set_output(stage); }
+        if (columns) {
+            second_weights = ggml_new_tensor_4d(ctx, weight_type, 256, pair_rows[1], batched ? 2 : 1, 1);
+            ggml_tensor * second = ggml_mul_mat(ctx, second_weights, input);
+            stages.push_back(second);
+            if (before) { second = ggml_scale_bias(ctx, second, 0.75f, 0.125f); stages.push_back(second); }
+            second = ggml_unary(ctx, second, op);
+            stages.push_back(second);
+            if (after) { second = ggml_scale_bias(ctx, second, 1.5f, -0.025f); stages.push_back(second); }
+            for (ggml_tensor * stage : stages) { ggml_set_output(stage); }
+            out = ggml_concat(ctx, out, second, 0);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -4283,7 +4297,8 @@ struct test_mul_mat_unary : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) { init_tensor_uniform(t); }
         // Exact projection sums keep the original backend tolerance valid.
-        for (ggml_tensor * t : {weights, input}) {
+        for (ggml_tensor * t : {weights, input, second_weights}) {
+            if (!t) { continue; }
             std::vector<float> values(ggml_nelements(t));
             for (size_t i = 0; i < values.size(); ++i) { values[i] = ((i*13 + i/127)%7 < 3 ? -1.0f : 1.0f)/32.0f; }
             if (t->type == GGML_TYPE_F16) {
@@ -9499,6 +9514,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_unary(type, op, false, true, true, true, true));
             test_cases.emplace_back(new test_mul_mat_unary(type, op, false, true, false, true, false, true));
             test_cases.emplace_back(new test_mul_mat_unary(type, op, false, true, true, true, true, true));
+        }
+    }
+
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32}) {
+        for (ggml_unary_op op : {GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID}) {
+            test_cases.emplace_back(new test_mul_mat_unary(type, op, true, true, false, false, false, false, 2, std::array<int64_t, 2>{32, 32}));
+            test_cases.emplace_back(new test_mul_mat_unary(type, op, true, true, false, false, false, false, 3, std::array<int64_t, 2>{33, 32}));
+            test_cases.emplace_back(new test_mul_mat_unary(type, op, true, true, true, false, false, false, 4, std::array<int64_t, 2>{32, 3}));
+            test_cases.emplace_back(new test_mul_mat_unary(type, op, true, true, false, false, false, false, 8, std::array<int64_t, 2>{257, 65}));
         }
     }
 

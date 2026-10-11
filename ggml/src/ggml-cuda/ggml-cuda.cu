@@ -3925,20 +3925,63 @@ static bool ggml_cuda_hc_post_norm_memory_ok(const ggml_cgraph * cgraph, int i, 
 
 // try and fuse nodes and return the number of nodes to skip
 
+static bool ggml_cuda_mmvf_pair_compute_policy(const ggml_tensor * node, int device, ggml_cuda_mmvf_pair_policy & policy) {
+    policy = {};
+    const auto & info = ggml_cuda_info().devices[device];
+    if (!GGML_CUDA_CC_IS_NVIDIA(info.cc) || info.cc < GGML_CUDA_CC_AMPERE || info.warp_size != 32) { return false; }
+    const auto type = node->src[0]->type;
+    switch (ggml_cuda_mul_mat_kernel(node->src[0], node->src[1], node, device)) {
+        case GGML_CUDA_MM_MMVF:
+            policy.half_acc = type == GGML_TYPE_F16 && fast_fp16_available(info.cc) && node->op_params[0] == GGML_PREC_DEFAULT;
+            return true;
+        case GGML_CUDA_MM_MMF:
+            // TF32 operand conversion is not represented by this load policy.
+            if (type == GGML_TYPE_F32) { return false; }
+            policy.round_input = true;
+            return true;
+        case GGML_CUDA_MM_CUBLAS:
+            if (type == GGML_TYPE_F32 || ggml_cuda_mul_mat_cublas_compute_type(info.cc, node->src[0], node->src[1], node, false) != type) { return false; }
+            policy.round_input = true;
+            policy.half_acc = type == GGML_TYPE_F16;
+            policy.half_output = type == GGML_TYPE_F16 && !ggml_cuda_cublas_prefer_f32_output(type, info.cc);
+            return true;
+        default: return false;
+    }
+}
+
 static bool ggml_cuda_mmvf_pair_node(const ggml_tensor * node, int device, bool allocated) {
     if (node->op != GGML_OP_MUL_MAT || !(node->flags & GGML_TENSOR_FLAG_COMPUTE) || node->view_src ||
-            node->type != GGML_TYPE_F32 || !node->src[0] || !node->src[1] || node->ne[1] != 1 ||
+            node->type != GGML_TYPE_F32 || !node->src[0] || !node->src[1] || node->ne[1] < 1 || node->ne[1] > MMVF_MAX_BATCH_SIZE ||
             !ggml_is_contiguous(node) || ggml_cuda_op_mul_mat_use_fwht(node)) { return false; }
     const ggml_tensor * weight = node->src[0], * input = node->src[1];
     if ((weight->type != GGML_TYPE_F32 && weight->type != GGML_TYPE_F16 && weight->type != GGML_TYPE_BF16) ||
-            input->type != GGML_TYPE_F32 || input->nb[0] != sizeof(float) || input->ne[1] != 1 ||
+            input->type != GGML_TYPE_F32 || input->nb[0] != sizeof(float) || input->ne[1] != node->ne[1] ||
+            (node->ne[1] > 1 && input->nb[1] % (2*sizeof(float))) ||
             input->nb[2] % (2*sizeof(float)) || input->nb[3] % (2*sizeof(float)) ||
             input->ne[0] > INT_MAX || node->ne[0] > INT_MAX || node->ne[2] > 65535 || node->ne[3] > 65535 ||
-            ggml_cuda_mul_mat_kernel(weight, input, node, device) != GGML_CUDA_MM_MMVF) { return false; }
+            (node->ne[1] == 1 && ggml_cuda_mul_mat_kernel(weight, input, node, device) != GGML_CUDA_MM_MMVF)) { return false; }
+    ggml_cuda_mmvf_pair_policy policy;
+    if (node->ne[1] > 1) {
+        const size_t size = ggml_type_size(weight->type);
+        if (input->ne[0] % 2 || weight->nb[0] != size) { return false; }
+        for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+            if (weight->nb[d] % (2*size)) { return false; }
+        }
+        if (!ggml_cuda_mmvf_pair_compute_policy(node, device, policy)) { return false; }
+    }
     for (const ggml_tensor * tensor : {weight, input, node}) {
         for (int d = 0; d < GGML_MAX_DIMS; ++d) {
             const size_t size = ggml_type_size(tensor->type);
             if (tensor->ne[d] <= 0 || tensor->nb[d] % size || tensor->nb[d]/size > INT_MAX) { return false; }
+        }
+        if (node->ne[1] > 1) {
+            size_t remaining = INT_MAX;
+            for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+                const size_t step = tensor->nb[d]/ggml_type_size(tensor->type);
+                const uint64_t count = tensor->ne[d] - 1;
+                if (step && count > remaining/step) { return false; }
+                remaining -= size_t(count)*step;
+            }
         }
         if (allocated) {
             uintptr_t begin, end;
@@ -7478,6 +7521,37 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
 
+                const auto mmvf_pair_image = [&](int partner) -> const void * {
+                    const ggml_tensor * input = node->src[1];
+                    if (partner < 0 || reuse.nodes.empty() || !ggml_is_contiguous(input)) { return nullptr; }
+                    for (const int reader : {i, partner}) {
+                        const int g = reuse.nodes[reader];
+                        if (g < 0 || !shared_inputs[g].get()) { continue; }
+                        const auto & image_group = reuse.groups[g];
+                        int prepared_end = image_group.prepare;
+                        if (image_group.after) {
+                            if (norm_emits.empty()) { continue; }
+                            const auto & emit = norm_emits[image_group.prepare];
+                            if (!emit.norm || (emit.f16 != g && emit.bf16 != g)) { continue; }
+                            prepared_end = emit.last;
+                        }
+                        if (prepared_end > i || (prepared_end == i && image_group.after)) { continue; }
+                        const int source = image_group.node;
+                        const ggml_tensor * prepared = cgraph->nodes[source]->src[1];
+                        if (input_keys[source] != node->src[0]->type || prepared->data != input->data ||
+                                !ggml_is_contiguous(prepared) || ggml_nbytes(prepared) != ggml_nbytes(input) ||
+                                input_sizes[source] != ggml_nelements(input)*sizeof(half)) { continue; }
+                        bool intact = true;
+                        for (int k = prepared_end + 1; k <= i && intact; ++k) {
+                            intact = !ggml_cuda_prepared_input_overwritten(cgraph->nodes[k], input);
+                        }
+                        if (intact && reinterpret_cast<uintptr_t>(shared_inputs[g].get()) % (2*sizeof(half)) == 0) {
+                            return shared_inputs[g].get();
+                        }
+                    }
+                    return nullptr;
+                };
+
                 int mmvf_partner = -1;
                 if (!disable_reuse && cuda_ctx->curr_stream_no == 0 && stream_ctx.concurrent_events.empty()) {
                     mmvf_partner = ggml_cuda_match_mmvf_pair(cgraph, i, cuda_ctx->device, mmvf_pairs);
@@ -7485,7 +7559,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (joint.partner >= 0 && !paired_mmvf.count(cgraph->nodes[mmvf_partner])) {
                         const ggml_cuda_scaled_unary_args first_ops{joint.first.first, joint.first.unary, joint.first.last};
                         const ggml_cuda_scaled_unary_args second_ops{joint.second.first, joint.second.unary, joint.second.last};
-                        ggml_cuda_mul_mat_vec_f_pair_postop(*cuda_ctx, node, cgraph->nodes[mmvf_partner], first_ops, second_ops);
+                        if (node->ne[1] > 1) {
+                            ggml_cuda_mmvf_pair_policy first_policy, second_policy;
+                            GGML_ASSERT(ggml_cuda_mmvf_pair_compute_policy(node, cuda_ctx->device, first_policy));
+                            GGML_ASSERT(ggml_cuda_mmvf_pair_compute_policy(cgraph->nodes[mmvf_partner], cuda_ctx->device, second_policy));
+                            const auto first_kernel = ggml_cuda_mul_mat_kernel(node->src[0], node->src[1], node, cuda_ctx->device);
+                            const auto second_kernel = ggml_cuda_mul_mat_kernel(cgraph->nodes[mmvf_partner]->src[0], cgraph->nodes[mmvf_partner]->src[1], cgraph->nodes[mmvf_partner], cuda_ctx->device);
+                            if ((first_kernel != GGML_CUDA_MM_MMF && first_kernel != GGML_CUDA_MM_CUBLAS) ||
+                                    (second_kernel != GGML_CUDA_MM_MMF && second_kernel != GGML_CUDA_MM_CUBLAS) ||
+                                    !ggml_cuda_mul_mat_f_pair_contract(*cuda_ctx, node, cgraph->nodes[mmvf_partner], first_policy, second_policy, first_ops, second_ops, mmvf_pair_image(mmvf_partner), first_kernel == GGML_CUDA_MM_MMF && second_kernel == GGML_CUDA_MM_MMF)) {
+                                ggml_cuda_mul_mat_vec_f_pair_multi(*cuda_ctx, node, cgraph->nodes[mmvf_partner], first_policy, second_policy, first_ops, second_ops, mmvf_pair_image(mmvf_partner));
+                            }
+                        } else {
+                            ggml_cuda_mul_mat_vec_f_pair_postop(*cuda_ctx, node, cgraph->nodes[mmvf_partner], first_ops, second_ops);
+                        }
                         for (int k = i + 1; k <= i + joint.first.count; ++k) { paired_mmvf.insert(cgraph->nodes[k]); }
                         for (int k = mmvf_partner; k <= mmvf_partner + joint.second.count; ++k) { paired_mmvf.insert(cgraph->nodes[k]); }
                         continue;
@@ -7507,7 +7594,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (!disable_reuse && cuda_ctx->curr_stream_no == 0 && stream_ctx.concurrent_events.empty()) {
                     const int partner = mmvf_partner;
                     if (partner >= 0 && !paired_mmvf.count(cgraph->nodes[partner])) {
-                        ggml_cuda_mul_mat_vec_f_pair(*cuda_ctx, node, cgraph->nodes[partner]);
+                        if (node->ne[1] > 1) {
+                            ggml_cuda_mmvf_pair_policy first_policy, second_policy;
+                            GGML_ASSERT(ggml_cuda_mmvf_pair_compute_policy(node, cuda_ctx->device, first_policy));
+                            GGML_ASSERT(ggml_cuda_mmvf_pair_compute_policy(cgraph->nodes[partner], cuda_ctx->device, second_policy));
+                            const auto first_kernel = ggml_cuda_mul_mat_kernel(node->src[0], node->src[1], node, cuda_ctx->device);
+                            const auto second_kernel = ggml_cuda_mul_mat_kernel(cgraph->nodes[partner]->src[0], cgraph->nodes[partner]->src[1], cgraph->nodes[partner], cuda_ctx->device);
+                            if ((first_kernel != GGML_CUDA_MM_MMF && first_kernel != GGML_CUDA_MM_CUBLAS) ||
+                                    (second_kernel != GGML_CUDA_MM_MMF && second_kernel != GGML_CUDA_MM_CUBLAS) ||
+                                    !ggml_cuda_mul_mat_f_pair_contract(*cuda_ctx, node, cgraph->nodes[partner], first_policy, second_policy, {}, {}, mmvf_pair_image(partner), first_kernel == GGML_CUDA_MM_MMF && second_kernel == GGML_CUDA_MM_MMF)) {
+                                ggml_cuda_mul_mat_vec_f_pair_multi(*cuda_ctx, node, cgraph->nodes[partner], first_policy, second_policy, {}, {}, mmvf_pair_image(partner));
+                            }
+                        } else {
+                            ggml_cuda_mul_mat_vec_f_pair(*cuda_ctx, node, cgraph->nodes[partner]);
+                        }
                         paired_mmvf.insert(cgraph->nodes[partner]);
                         continue;
                     }
@@ -7721,6 +7821,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             if (joint.partner >= 0) {
                 for (int k = i + 1; k <= i + joint.first.count; ++k) { params->add_alloc_dep(params->user_data, cgraph->nodes[k], first); }
                 for (int k = partner + 1; k <= partner + joint.second.count; ++k) { params->add_alloc_dep(params->user_data, cgraph->nodes[k], first); }
+            }
+            if (first->ne[1] > 1) {
+                ggml_tensor * terminal = joint.partner >= 0 ? cgraph->nodes[partner + joint.second.count] : second;
+                for (ggml_tensor * read : {first->src[0], first->src[1], second->src[0]}) {
+                    params->add_alloc_dep(params->user_data, read, terminal);
+                    if (read->view_src) { params->add_alloc_dep(params->user_data, read->view_src, terminal); }
+                }
             }
             paired_mmvf.insert(second);
         }

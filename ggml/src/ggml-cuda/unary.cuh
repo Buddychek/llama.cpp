@@ -152,3 +152,40 @@ struct ggml_cuda_affine_unary_ops {
 };
 
 void ggml_cuda_op_affine_unary_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * src, ggml_tensor * mm, const ggml_cuda_affine_unary_ops & ops);
+
+struct ggml_cuda_mmvf_postop_store {
+    float * pre;
+    float * unary;
+    float * post;
+    float scale0;
+    float bias0;
+    float scale1;
+    float bias1;
+    ggml_unary_op op;
+
+    __device__ __forceinline__ void operator()(float * dst, const float * base, int index, float value) const {
+        dst[index] = value;
+        if (!unary) { return; }
+        const int64_t offset = dst - base + index;
+        if (pre) {
+            value = scale0 * value + bias0;
+            if (pre == base) { dst[index] = value; } else { pre[offset] = value; }
+        }
+        value = op == GGML_UNARY_OP_SILU ? ggml_cuda_op_silu_single(value) : 1.0f / (1.0f + expf(-value));
+        if (unary == base) { dst[index] = value; } else { unary[offset] = value; }
+        if (post) {
+            value = scale1 * value + bias1;
+            if (post == base) { dst[index] = value; } else { post[offset] = value; }
+        }
+    }
+};
+
+static inline ggml_cuda_mmvf_postop_store ggml_cuda_mmvf_postop_args(const ggml_cuda_scaled_unary_args & args) {
+    if (!args.unary) { return ggml_cuda_mmvf_postop_store{}; }
+    const bool before = args.first != args.unary, after = args.last != args.unary;
+    return ggml_cuda_mmvf_postop_store{before ? (float *) args.first->data : nullptr, (float *) args.unary->data,
+        after ? (float *) args.last->data : nullptr,
+        before ? ggml_get_op_params_f32(args.first, 0) : 1.0f, before ? ggml_get_op_params_f32(args.first, 1) : 0.0f,
+        after ? ggml_get_op_params_f32(args.last, 0) : 1.0f, after ? ggml_get_op_params_f32(args.last, 1) : 0.0f,
+        ggml_get_unary_op(args.unary)};
+}

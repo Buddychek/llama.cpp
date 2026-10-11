@@ -22,3 +22,13 @@ void ggml_cuda_mul_mat_vec_f_pair(ggml_backend_cuda_context & ctx, const ggml_te
 struct ggml_cuda_scaled_unary_args;
 void ggml_cuda_mul_mat_vec_f_pair_postop(ggml_backend_cuda_context & ctx, const ggml_tensor * first, const ggml_tensor * second,
         const ggml_cuda_scaled_unary_args & first_ops, const ggml_cuda_scaled_unary_args & second_ops);
+
+struct ggml_cuda_mmvf_pair_policy {
+    bool round_input = false;
+    bool half_acc = false;
+    bool half_output = false;
+};
+
+void ggml_cuda_mul_mat_vec_f_pair_multi(ggml_backend_cuda_context & ctx, const ggml_tensor * first, const ggml_tensor * second,
+        ggml_cuda_mmvf_pair_policy first_policy, ggml_cuda_mmvf_pair_policy second_policy,
+        const ggml_cuda_scaled_unary_args & first_ops, const ggml_cuda_scaled_unary_args & second_ops, const void * prepared_input = nullptr);

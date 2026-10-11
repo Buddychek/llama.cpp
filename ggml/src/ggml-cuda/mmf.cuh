@@ -44,16 +44,31 @@ struct mmf_ids_data {
 
 void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 
+struct ggml_cuda_scaled_unary_args;
+bool ggml_cuda_mul_mat_f_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * first, const ggml_tensor * second, const ggml_cuda_scaled_unary_args & first_ops, const ggml_cuda_scaled_unary_args & second_ops);
+
+struct ggml_cuda_mmvf_pair_policy;
+bool ggml_cuda_mul_mat_f_pair_contract(ggml_backend_cuda_context & ctx, const ggml_tensor * first, const ggml_tensor * second,
+        const ggml_cuda_mmvf_pair_policy & first_policy, const ggml_cuda_mmvf_pair_policy & second_policy,
+        const ggml_cuda_scaled_unary_args & first_ops, const ggml_cuda_scaled_unary_args & second_ops, const void * prepared_input, bool both_mmf);
+
 bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * scr0_ne, const size_t * src0_nb, const int src1_ncols, bool mul_mat_id);
 
-template <typename T, int rows_per_block, int cols_per_block, int nwarps, bool has_ids, int warp_splits = 1, bool prefetch = false>
-__launch_bounds__(ggml_cuda_get_physical_warp_size()*nwarps, 1)
-static __global__ void mul_mat_f(
+struct ggml_cuda_mmf_store {
+    __device__ __forceinline__ void operator()(float * dst, const float * base, int index, float value) const {
+        dst[index] = value;
+        GGML_UNUSED(base);
+    }
+};
+
+template <typename T, int rows_per_block, int cols_per_block, int nwarps, bool has_ids, int warp_splits = 1, bool prefetch = false, typename Write = ggml_cuda_mmf_store, bool Masked = false, bool HalfAcc = false, bool Image = false>
+static __device__ __forceinline__ void mul_mat_f_impl(
         const T * __restrict__ x, const float * __restrict__ y, const int32_t * __restrict__ ids, float * __restrict__ dst,
         const int ncols, const int ncols_dst_total, const int nchannels_dst, const int stride_row, const int stride_col_y, const int stride_col_dst,
         const int stride_col_id, const int stride_row_id,
         const int channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
-        const int sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
+        const int sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst, const int row0, const Write write = {}, const int rows = INT_MAX, const void * prepared_input = nullptr) {
+    float * const output_base = dst;
 // TODO: handle this in a consistent and simpler way after AMD MFMA support has been added
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 #if defined(AMD_WMMA_AVAILABLE)
@@ -76,10 +91,11 @@ static __global__ void mul_mat_f(
     if constexpr (rows_per_block != MMF_ROWS_PER_BLOCK) {NO_DEVICE_CODE;} else {
     typedef tile<16, 8, T>     tile_A;
     typedef tile<8,  8, T>     tile_B;
-    typedef tile<16, 8, float> tile_C;
+    using tile_C = std::conditional_t<HalfAcc, tile<16, 4, half2>, tile<16, 8, float>>;
 #endif // VOLTA_MMA_AVAILABLE
 #endif // defined(AMD_WMMA_AVAILABLE)
-    if constexpr (!tile_A::supported() || !tile_B::supported() || !tile_C::supported()) {
+    static_assert(!HalfAcc || (std::is_same_v<T, half2> && Masked && !has_ids), "half accumulator belongs to the rounded paired contract");
+    if constexpr (!tile_A::supported() || !tile_B::supported() || (!HalfAcc && !tile_C::supported())) {
         NO_DEVICE_CODE;
         return;
     }
@@ -89,7 +105,7 @@ static __global__ void mul_mat_f(
     constexpr int ntA = rows_per_block / tile_A::I;
     constexpr int ntB = (cols_per_block + tile_B::I - 1) / tile_B::I;
 
-    const int row0        = blockIdx.x * rows_per_block;
+
 
     int expert_idx = 0;
     [[maybe_unused]] int col_base = 0;
@@ -128,6 +144,11 @@ static __global__ void mul_mat_f(
     }
 
     [[maybe_unused]] const float2 * y2 = (const float2 *) y;
+    [[maybe_unused]] const T * image = (const T *) prepared_input;
+    if constexpr (Image) {
+        static_assert(!has_ids && Masked, "prepared image belongs to the rounded paired contract");
+        image += (int64_t(sample_y)*stride_sample_y + channel_y*stride_channel_y)/2;
+    }
 
     extern __shared__ char data_mmv[];
 
@@ -178,6 +199,13 @@ static __global__ void mul_mat_f(
         for (int i = threadIdx.x; i < rows_per_block*warp_size/4; i += warp_size) {
             const int row = i/(warp_size/4);
             const int k = 4*(i%(warp_size/4));
+            if constexpr (Masked) {
+                if (row0 + row >= rows) {
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) { staged_x[row*tile_k_padded + k + j] = ggml_cuda_cast<T>(make_float2(0.0f, 0.0f)); }
+                    continue;
+                }
+            }
             cp_async_cg_16<0>(ggml_cuda_cvta_generic_to_shared(staged_x + row*tile_k_padded + k), x + row*stride_row + col + k);
         }
     };
@@ -194,7 +222,11 @@ static __global__ void mul_mat_f(
                 ggml_cuda_syncwarp();
 #pragma unroll
                 for (int i = 0; i < tile_A::I; ++i) {
+                    if constexpr (Masked) {
+                        tile_xy[i*tile_k_padded + threadIdx.x] = row0 + itA*tile_A::I + i < rows ? x[(itA*tile_A::I + i)*stride_row + col] : ggml_cuda_cast<T>(make_float2(0.0f, 0.0f));
+                    } else {
                     tile_xy[i*tile_k_padded + threadIdx.x] = x[(itA*tile_A::I + i)*stride_row + col];
+                    }
                 }
                 ggml_cuda_syncwarp();
             }
@@ -231,8 +263,12 @@ static __global__ void mul_mat_f(
                     const int j = j0 + itB*tile_B::I;
 
                     if constexpr (!has_ids) {
+                        if constexpr (Image) {
+                            tile_xy[j0*tile_k_padded + threadIdx.x] = j < cols_per_block ? image[j*stride_col_y + col] : ggml_cuda_cast<T>(make_float2(0.0f, 0.0f));
+                        } else {
                         const float2 tmp = j < cols_per_block ? y2[j*stride_col_y + col] : make_float2(0.0f, 0.0f);
                         tile_xy[j0*tile_k_padded + threadIdx.x] = ggml_cuda_cast<T>(tmp);
+                        }
                     } else {
                         const bool valid = j < cols_per_block && (col_base + j) < ncols_dst_total && slot_map[j] >= 0;
                         float2 tmp = valid ? *(const float2*) &y[slot_map[j]*stride_channel_y + 2*(j*stride_col_y + col)] : make_float2(0.0f, 0.0f);
@@ -270,8 +306,15 @@ static __global__ void mul_mat_f(
 #pragma unroll
             for (int l = 0; l < tile_C::ne; ++l) {
                 const int i = threadIdx.y*rows_per_block + itA*tile_C::I + tile_C::get_i(l);
+                if constexpr (HalfAcc) {
+                    const int j = itB*tile_B::I + 2*tile_C::get_j(l);
+                    const float2 value = __half22float2(C[itA][itB].x[l]);
+                    buf_iw[j*kiw + i] = value.x;
+                    buf_iw[(j + 1)*kiw + i] = value.y;
+                } else {
                 const int j = itB*tile_C::J + tile_C::get_j(l);
                 buf_iw[j*kiw + i] = C[itA][itB].x[l];
+                }
             }
         }
     }
@@ -310,14 +353,17 @@ static __global__ void mul_mat_f(
         if constexpr (!has_ids) {
 #pragma unroll
             for (int i0 = 0; i0 < sizeof(sum)/sizeof(sum[0]); ++i0) {
-                dst[j*stride_col_dst + row0 + i0*warp_size + threadIdx.x] = sum[i0];
+                if constexpr (Masked) { if (row0 + i0*warp_size + threadIdx.x >= rows) { continue; } }
+                if constexpr (std::is_same_v<Write, ggml_cuda_mmf_store>) { dst[j*stride_col_dst + row0 + i0*warp_size + threadIdx.x] = sum[i0]; }
+                    else { write(dst, output_base, j*stride_col_dst + row0 + i0*warp_size + threadIdx.x, sum[i0]); }
             }
         } else {
             const int slot = (j < cols_per_block) ? slot_map[j] : -1;
             if (slot >= 0 && (col_base + j) < ncols_dst_total) {
 #pragma unroll
                 for (int i0 = 0; i0 < sizeof(sum)/sizeof(sum[0]); ++i0) {
-                    dst[slot*stride_channel_dst + j*stride_col_dst + row0 + i0*warp_size + threadIdx.x] = sum[i0];
+                    if constexpr (std::is_same_v<Write, ggml_cuda_mmf_store>) { dst[slot*stride_channel_dst + j*stride_col_dst + row0 + i0*warp_size + threadIdx.x] = sum[i0]; }
+                    else { write(dst, output_base, slot*stride_channel_dst + j*stride_col_dst + row0 + i0*warp_size + threadIdx.x, sum[i0]); }
                 }
             }
         }
@@ -331,6 +377,20 @@ static __global__ void mul_mat_f(
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
     NO_DEVICE_CODE;
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+}
+
+template <typename T, int rows_per_block, int cols_per_block, int nwarps, bool has_ids, int warp_splits = 1, bool prefetch = false>
+__launch_bounds__(ggml_cuda_get_physical_warp_size()*nwarps, 1)
+static __global__ void mul_mat_f(
+        const T * __restrict__ x, const float * __restrict__ y, const int32_t * __restrict__ ids, float * __restrict__ dst,
+        const int ncols, const int ncols_dst_total, const int nchannels_dst, const int stride_row, const int stride_col_y, const int stride_col_dst,
+        const int stride_col_id, const int stride_row_id,
+        const int channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const int sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
+    mul_mat_f_impl<T, rows_per_block, cols_per_block, nwarps, has_ids, warp_splits, prefetch>(
+        x, y, ids, dst, ncols, ncols_dst_total, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
+        stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, blockIdx.x*rows_per_block);
 }
 
 //This kernel is for larger batch sizes of mul_mat_id
