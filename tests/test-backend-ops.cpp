@@ -4474,6 +4474,7 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     const bool computed;
     const bool ordered;
     const bool swap_add;
+    const int64_t projection_rank;
     std::vector<ggml_tensor *> stages;
     ggml_tensor * projection = nullptr;
     ggml_tensor * projection_weights = nullptr;
@@ -4485,15 +4486,15 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_embd, n_hc, n_tokens, gated) + (projection_type == GGML_TYPE_COUNT ? "" : "," + VARS_TO_STR2(projection_type, computed)) + (ordered ? "," + VARS_TO_STR2(ordered, swap_add) : "");
+        return VARS_TO_STR4(n_embd, n_hc, n_tokens, gated) + (projection_type == GGML_TYPE_COUNT ? "" : "," + VARS_TO_STR2(projection_type, computed)) + (ordered ? "," + VARS_TO_STR2(ordered, swap_add) : "") + (projection_rank == 127 ? "" : "," + VARS_TO_STR1(projection_rank));
     }
 
     bool run_whole_graph() override { return ordered || projection_type != GGML_TYPE_COUNT; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return ordered ? stages : projection ? std::vector<ggml_tensor *>{projection, out} : std::vector<ggml_tensor *>{}; }
     double max_nmse_err() override { return ordered ? 1e-7 : test_dsv4_hc::max_nmse_err(); }
 
-    test_dsv4_hc_pre(int64_t n_embd = 31, int64_t n_hc = 4, int64_t n_tokens = 17, bool gated = false, ggml_type projection_type = GGML_TYPE_COUNT, bool computed = false, bool ordered = false, bool swap_add = false)
-        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens), gated(gated), projection_type(projection_type), computed(computed), ordered(ordered), swap_add(swap_add) {}
+    test_dsv4_hc_pre(int64_t n_embd = 31, int64_t n_hc = 4, int64_t n_tokens = 17, bool gated = false, ggml_type projection_type = GGML_TYPE_COUNT, bool computed = false, bool ordered = false, bool swap_add = false, int64_t projection_rank = 127)
+        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens), gated(gated), projection_type(projection_type), computed(computed), ordered(ordered), swap_add(swap_add), projection_rank(projection_rank) {}
 
     void initialize_tensors(ggml_context * ctx) override {
         test_dsv4_hc::initialize_tensors(ctx);
@@ -4522,8 +4523,8 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
         if (gated) {
             ggml_tensor * gate;
             if (projection_type != GGML_TYPE_COUNT) {
-                ggml_tensor * weights = ggml_new_tensor_2d(ctx, projection_type, 127, n_embd*n_hc);
-                ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 127, n_tokens);
+                ggml_tensor * weights = ggml_new_tensor_2d(ctx, projection_type, projection_rank, n_embd*n_hc);
+                ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, projection_rank, n_tokens);
                 projection_weights = weights;
                 projection_input = input;
                 if (computed) { weights = ggml_cont(ctx, weights); }
@@ -9526,6 +9527,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(512, 4, 32, true, GGML_TYPE_F16));
     test_cases.emplace_back(new test_dsv4_hc_pre(257, 3, 17, true, GGML_TYPE_F16, true));
     test_cases.emplace_back(new test_dsv4_hc_pre(257, 3, 17, true, GGML_TYPE_BF16));
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, 1, true, type, false, false, false, 320));
+    }
+    test_cases.emplace_back(new test_dsv4_hc_pre(1281, 3, 1, true, GGML_TYPE_F16, false, false, false, 264));
     for (int64_t n_hc : {1, 2, 3, 5, 8, 65}) {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17));
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));

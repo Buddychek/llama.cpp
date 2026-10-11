@@ -934,6 +934,117 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
     }
 }
 
+template <typename T, typename Acc, int Block, bool LaunchComplete = true>
+static __device__ __forceinline__ float mmvf_packed_dot(const T * x, const float * y, int ncols2, bool valid) {
+    constexpr int packs = (Block + 127)/128;
+    using Pair = std::conditional_t<std::is_same_v<T, float>, float2, std::conditional_t<std::is_same_v<T, half>, half2, nv_bfloat162>>;
+    using Partial = std::conditional_t<std::is_same_v<Acc, half>, half2, float>;
+    const int lane = threadIdx.x;
+    Partial partial[packs][4];
+#pragma unroll
+    for (int pack = 0; pack < packs; ++pack) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if constexpr (std::is_same_v<Acc, half>) { partial[pack][j] = make_half2(0.0f, 0.0f); } else { partial[pack][j] = 0.0f; }
+        }
+        const int logical = pack*128 + lane*4;
+        if (valid && logical < Block) {
+            for (int col = logical; col < ncols2; col += Block) {
+                float4 y0, y1;
+                ggml_cuda_memcpy_1<16>(&y0, y + int64_t(2)*col);
+                ggml_cuda_memcpy_1<16>(&y1, y + int64_t(2)*col + 4);
+                const float2 values[4] = {make_float2(y0.x, y0.y), make_float2(y0.z, y0.w), make_float2(y1.x, y1.y), make_float2(y1.z, y1.w)};
+                Pair weights[4];
+                if constexpr (std::is_same_v<T, float>) {
+                    float4 w0, w1;
+                    ggml_cuda_memcpy_1<16>(&w0, x + int64_t(2)*col);
+                    ggml_cuda_memcpy_1<16>(&w1, x + int64_t(2)*col + 4);
+                    weights[0] = make_float2(w0.x, w0.y); weights[1] = make_float2(w0.z, w0.w);
+                    weights[2] = make_float2(w1.x, w1.y); weights[3] = make_float2(w1.z, w1.w);
+                } else {
+                    uint4 bits;
+                    ggml_cuda_memcpy_1<16>(&bits, x + int64_t(2)*col);
+                    memcpy(weights, &bits, sizeof(bits));
+                }
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    if constexpr (std::is_same_v<Acc, half>) {
+#ifdef FP16_AVAILABLE
+                        partial[pack][j] += weights[j]*make_half2(values[j].x, values[j].y);
+#else
+                        NO_DEVICE_CODE;
+#endif
+                    } else if constexpr (std::is_same_v<T, half>) {
+                        const float2 w = __half22float2(weights[j]);
+                        ggml_cuda_mad(partial[pack][j], w.x, values[j].x);
+                        ggml_cuda_mad(partial[pack][j], w.y, values[j].y);
+                    } else {
+                        ggml_cuda_mad(partial[pack][j], ggml_cuda_cast<float>(weights[j].x), values[j].x);
+                        ggml_cuda_mad(partial[pack][j], ggml_cuda_cast<float>(weights[j].y), values[j].y);
+                    }
+                }
+            }
+        }
+    }
+    if constexpr (LaunchComplete) { ggml_cuda_pdl_lc(); }
+    float sums[packs][4];
+#pragma unroll
+    for (int pack = 0; pack < packs; ++pack) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            if constexpr (std::is_same_v<Acc, half>) { sums[pack][j] = __low2float(partial[pack][j]) + __high2float(partial[pack][j]); } else { sums[pack][j] = partial[pack][j]; }
+        }
+        // Preserve the original logical-lane XOR tree.
+#pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                sums[pack][j] += __shfl_xor_sync(0xffffffff, sums[pack][j], offset, 8);
+            }
+        }
+        const float a = sums[pack][0], b = sums[pack][1], c = sums[pack][2], d = sums[pack][3];
+        sums[pack][0] = a + c; sums[pack][1] = b + d;
+        sums[pack][2] = c + a; sums[pack][3] = d + b;
+        const float e = sums[pack][0], f = sums[pack][1], g = sums[pack][2], h = sums[pack][3];
+        sums[pack][0] = e + f; sums[pack][1] = f + e;
+        sums[pack][2] = g + h; sums[pack][3] = h + g;
+    }
+    if constexpr (Block == 32) {
+        return __shfl_sync(0xffffffff, sums[0][0], 0);
+    } else {
+        float value = 0.0f;
+#pragma unroll
+        for (int pack = 0; pack < packs; ++pack) {
+            const float v = __shfl_sync(0xffffffff, sums[pack][0], 8*(lane & 3));
+            if (lane/4 == pack && lane < Block/32) { value = v; }
+        }
+        return warp_reduce_sum<32>(value);
+    }
+}
+
+template <typename T, typename Acc, int Block>
+static __global__ void mul_mat_vec_f_hc_packed_rows(
+        const T * weight, const float * input, const float * norm, float * gate, float * dst,
+        int k2, int weight_stride, int n, int hc,
+        int64_t norm_stride0, int64_t norm_stride1, float scale) {
+    const uint32_t i0 = blockIdx.x*4 + threadIdx.y;
+    const bool valid = i0 < uint32_t(n);
+    float sum = 0.0f;
+    ggml_cuda_pdl_sync();
+    for (int64_t ih = 0; ih < hc; ++ih) {
+        const int64_t row = (valid ? i0 : 0) + ih*n;
+        const float value = mmvf_packed_dot<T, Acc, Block, false>(weight + row*weight_stride, input, k2, valid);
+        if (valid && threadIdx.x == 0) {
+            gate[row] = value;
+            const float xv = norm[int64_t(i0)*norm_stride0 + ih*norm_stride1];
+            const float wv = 1.0f / (1.0f + expf(-value));
+            sum += xv*wv;
+        }
+    }
+    ggml_cuda_pdl_lc();
+    if (valid && threadIdx.x == 0) { dst[i0] = scale*sum; }
+}
+
 struct ggml_cuda_mmvf_hc_store {
     const float * norm;
     float * sum;
@@ -1139,6 +1250,21 @@ static void ggml_cuda_mmvf_hc_launch(ggml_backend_cuda_context & ctx, const ggml
     const ggml_tensor * weight = mm->src[0];
     const ggml_tensor * input = mm->src[1];
     const ggml_tensor * norm = dst->src[0];
+    if constexpr (Columns == 1 && Block >= 128 && ggml_cuda_get_physical_warp_size() == 32) {
+        const auto & device = ggml_cuda_info().devices[ctx.device];
+        const uintptr_t alignment = reinterpret_cast<uintptr_t>(weight->data) | reinterpret_cast<uintptr_t>(input->data) | weight->nb[1];
+        if (GGML_CUDA_CC_IS_NVIDIA(device.cc) && device.cc >= GGML_CUDA_CC_AMPERE && device.warp_size == 32 &&
+                device.nsm > 0 && (uint64_t(norm->ne[0]) + 3)/4 >= uint64_t(4)*device.nsm &&
+                norm->ne[0] <= INT32_MAX && norm->ne[1] <= INT32_MAX && weight->nb[1]/sizeof(T) <= INT32_MAX &&
+                weight->ne[0] % 8 == 0 && weight->ne[0]/2 <= Block && (alignment & 15) == 0) {
+            const ggml_cuda_kernel_launch_params params = {dim3((uint64_t(norm->ne[0]) + 3)/4, 1, 1), dim3(32, 4, 1), 0, ctx.stream()};
+            ggml_cuda_kernel_launch(mul_mat_vec_f_hc_packed_rows<T, Acc, Block>, params,
+                (const T *) weight->data, (const float *) input->data, (const float *) norm->data, (float *) mm->data, (float *) dst->data,
+                int(weight->ne[0]/2), int(weight->nb[1]/sizeof(T)), int(norm->ne[0]), int(norm->ne[1]),
+                int64_t(norm->nb[0]/sizeof(float)), int64_t(norm->nb[1]/sizeof(float)), ggml_get_op_params_f32(dst, 0));
+            return;
+        }
+    }
     auto kernel = mul_mat_vec_f_hc_pre<T, Acc, Columns, Block>;
     const int shared = ggml_cuda_info().devices[ctx.device].warp_size*sizeof(float);
     const ggml_cuda_kernel_launch_params params = {dim3(norm->ne[0], 1, 1), dim3(Block, 1, 1), shared, ctx.stream()};
