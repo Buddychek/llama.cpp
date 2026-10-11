@@ -57,6 +57,11 @@ struct ggml_cuda_hc_affine_emit_data {
     int64_t padded = 0;
     int64_t rows = 0;
     int layout = 0;
+    void * mmq_images[3] = {};
 };
 
 void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * added, ggml_tensor * unary, ggml_tensor * last, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, const ggml_cuda_hc_affine_emit_data * emit = nullptr, ggml_tensor * scale = nullptr);
+
+void ggml_cuda_op_rms_norm_mmq_multi(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * add, ggml_tensor * scale, void * const images[3], int64_t cols, int64_t padded, int64_t rows);
+
+void ggml_cuda_op_hc_post_norm_emit_mmq_multi(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * scale, void * f16, void * bf16, void * const images[3], int64_t cols, int64_t padded, int64_t rows);

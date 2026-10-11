@@ -226,6 +226,23 @@ struct ggml_cuda_norm_mmq_store {
     }
 };
 
+struct ggml_cuda_norm_mmq_bundle_store {
+    static constexpr int width = 4;
+    block_q8_1_mmq * images[3];
+    int64_t cols;
+    int64_t padded;
+    int64_t rows;
+
+    __device__ __forceinline__ void operator()(float * dst, const float * base, int col, float4 value) const {
+        dst[col] = value.x; dst[col + 1] = value.y;
+        dst[col + 2] = value.z; dst[col + 3] = value.w;
+        const int64_t index = dst - base + col;
+        if (images[0]) { ggml_cuda_norm_mmq_store<MMQ_Q8_1_DS_LAYOUT_D4>{images[0], cols, padded, rows}.emit(index, value); }
+        if (images[1]) { ggml_cuda_norm_mmq_store<MMQ_Q8_1_DS_LAYOUT_DS4>{images[1], cols, padded, rows}.emit(index, value); }
+        if (images[2]) { ggml_cuda_norm_mmq_store<MMQ_Q8_1_DS_LAYOUT_D2S6>{images[2], cols, padded, rows}.emit(index, value); }
+    }
+};
+
 struct ggml_cuda_norm_mxfp4_store {
     static constexpr int width = 4;
     block_fp4_mmq * image;
@@ -578,6 +595,36 @@ static __global__ void rms_norm_mmq_f32(const float * x,
                                     const float   scale_out            = 1.0f) {
     rms_norm_f32_impl<block_size, do_multiply, do_add, do_scale>(
         x, dst, ncols, stride_row, stride_channel, stride_sample, eps, ggml_cuda_norm_mmq_store<Layout>{(block_q8_1_mmq *) image, cols, padded, rows}, mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add, add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out);
+}
+
+template <int block_size, bool do_multiply = false, bool do_add = false, bool do_scale = false>
+static __global__ void rms_norm_mmq_multi_f32(const float * x,
+                                    float *       dst,
+                                    const int     ncols,
+                                    const int64_t stride_row,
+                                    const int64_t stride_channel,
+                                    const int64_t stride_sample,
+                                    const float   eps,
+                                    const ggml_cuda_norm_mmq_bundle_store write,
+                                    const float * mul                  = nullptr,
+                                    const int64_t mul_stride_row       = 0,
+                                    const int64_t mul_stride_channel   = 0,
+                                    const int64_t mul_stride_sample    = 0,
+                                    const uint3   mul_ncols_packed     = make_uint3(0, 0, 0),
+                                    const uint3   mul_nrows_packed     = make_uint3(0, 0, 0),
+                                    const uint3   mul_nchannels_packed = make_uint3(0, 0, 0),
+                                    const uint3   mul_nsamples_packed  = make_uint3(0, 0, 0),
+                                    const float * add                  = nullptr,
+                                    const int64_t add_stride_row       = 0,
+                                    const int64_t add_stride_channel   = 0,
+                                    const int64_t add_stride_sample    = 0,
+                                    const uint3   add_ncols_packed     = make_uint3(0, 0, 0),
+                                    const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
+                                    const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
+                                    const uint3   add_nsamples_packed  = make_uint3(0, 0, 0),
+                                    const float   scale_out            = 1.0f) {
+    rms_norm_f32_impl<block_size, do_multiply, do_add, do_scale>(
+        x, dst, ncols, stride_row, stride_channel, stride_sample, eps, write, mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add, add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed, scale_out);
 }
 
 template <int block_size, bool do_multiply = false, bool do_add = false, bool do_scale = false>
@@ -1305,6 +1352,49 @@ struct ggml_cuda_hc_norm_emit_mmq_pair_store {
     }
 };
 
+template <bool Scale>
+struct ggml_cuda_hc_norm_mmq_bundle_store {
+    static constexpr int width = 2;
+    block_q8_1_mmq * images[3];
+    uint3 cols;
+    int64_t padded;
+    int64_t rows;
+    half * f16;
+    nv_bfloat16 * bf16;
+    float scale;
+
+    template <mmq_q8_1_ds_layout Layout>
+    __device__ __forceinline__ void emit(uint2 rc, float2 value) const {
+        constexpr int group = Layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
+        const ggml_cuda_hc_norm_emit_mmq_pair_store<Layout, false> write = {
+            images[int(Layout)], cols, padded, rows, nullptr, nullptr, 1.0f};
+        write.store(rc.y, rc.x, value);
+        if (rc.y >= cols.z - group) {
+            for (int64_t tail = cols.z; tail < padded; tail += group) {
+                write.store(tail + rc.y % group, rc.x, make_float2(0.0f, 0.0f));
+            }
+        }
+    }
+
+    __device__ __forceinline__ void operator()(float * dst, const float * base, int col, float2 value) const {
+        if constexpr (Scale) { value.x = scale * value.x; value.y = scale * value.y; }
+        dst[col] = value.x; dst[col + 1] = value.y;
+        const int64_t index = dst - base + col;
+        const uint2 rc = fast_div_modulo(uint32_t(index), cols);
+        if (images[0]) { emit<MMQ_Q8_1_DS_LAYOUT_D4>(rc, value); }
+        if (images[1]) { emit<MMQ_Q8_1_DS_LAYOUT_DS4>(rc, value); }
+        if (images[2]) { emit<MMQ_Q8_1_DS_LAYOUT_D2S6>(rc, value); }
+        if (f16) {
+            f16[index] = ggml_cuda_cast<half>(value.x);
+            f16[index + 1] = ggml_cuda_cast<half>(value.y);
+        }
+        if (bf16) {
+            bf16[index] = ggml_cuda_cast<nv_bfloat16>(value.x);
+            bf16[index + 1] = ggml_cuda_cast<nv_bfloat16>(value.y);
+        }
+    }
+};
+
 struct hc_post_norm_data {
     const float * x;
     const float * residual;
@@ -1447,11 +1537,22 @@ static __global__ __launch_bounds__(Block) void hc_post_norm_emit_mmq_f32(hc_pos
         ggml_cuda_hc_norm_emit_mmq_pair_store<Layout, Scale>{(block_q8_1_mmq *) image, cols, padded, rows, f16, bf16, scale});
 }
 
-template <mmq_q8_1_ds_layout Layout, int Block, bool Comb, bool Multiply, bool Scale>
+template <int Block, bool Comb, bool Multiply, bool Scale, int NormLayout>
+static __global__ __launch_bounds__(Block) void hc_post_norm_emit_mmq_multi_f32(hc_post_norm_data a, ggml_cuda_hc_norm_mmq_bundle_store<Scale> write) {
+    hc_post_norm_f32_impl<Block, Comb, Multiply, NormLayout>(a, write);
+}
+
+template <mmq_q8_1_ds_layout Layout, int Block, bool Comb, bool Multiply, bool Scale, bool Multi = false>
 static auto hc_post_norm_emit_mmq_kernel(int layout) {
-    if (layout == 1) { return hc_post_norm_emit_mmq_f32<Layout, Block, Comb, Multiply, Scale, 1>; }
-    if (layout == 2) { return hc_post_norm_emit_mmq_f32<Layout, Block, Comb, Multiply, Scale, 2>; }
-    return hc_post_norm_emit_mmq_f32<Layout, Block, Comb, Multiply, Scale, 0>;
+    if constexpr (Multi) {
+        if (layout == 1) { return hc_post_norm_emit_mmq_multi_f32<Block, Comb, Multiply, Scale, 1>; }
+        if (layout == 2) { return hc_post_norm_emit_mmq_multi_f32<Block, Comb, Multiply, Scale, 2>; }
+        return hc_post_norm_emit_mmq_multi_f32<Block, Comb, Multiply, Scale, 0>;
+    } else {
+        if (layout == 1) { return hc_post_norm_emit_mmq_f32<Layout, Block, Comb, Multiply, Scale, 1>; }
+        if (layout == 2) { return hc_post_norm_emit_mmq_f32<Layout, Block, Comb, Multiply, Scale, 2>; }
+        return hc_post_norm_emit_mmq_f32<Layout, Block, Comb, Multiply, Scale, 0>;
+    }
 }
 
 struct ggml_cuda_norm_scale_store {
@@ -1839,8 +1940,50 @@ void ggml_cuda_op_rms_norm_mmq(ggml_backend_cuda_context & ctx, ggml_tensor * no
     }
 }
 
-template <mmq_q8_1_ds_layout Layout>
-static void ggml_cuda_hc_post_norm_emit_mmq_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * scale, void * f16, void * bf16, void * image, int64_t cols, int64_t padded, int64_t rows) {
+template <int Block, bool Multiply, bool Add, bool Scale>
+static void ggml_cuda_rms_norm_mmq_multi_launch(ggml_backend_cuda_context & ctx, ggml_tensor * norm,
+        ggml_tensor * mul, ggml_tensor * add, ggml_tensor * scale, void * const images[3], int64_t cols, int64_t padded, int64_t rows) {
+    const ggml_tensor * x = norm->src[0];
+    const ggml_tensor * weight = mul ? (mul->src[0] == norm ? mul->src[1] : mul->src[0]) : nullptr;
+    const ggml_tensor * bias = add ? (add->src[0] == mul ? add->src[1] : add->src[0]) : nullptr;
+    ggml_tensor * dst = scale ? scale : add ? add : mul ? mul : norm;
+    const auto pointer = [](const ggml_tensor * t) { return t ? (const float *) t->data : nullptr; };
+    const auto stride = [](const ggml_tensor * t, int d) { return t ? int64_t(t->nb[d]/sizeof(float)) : int64_t(0); };
+    const auto divisor = [](const ggml_tensor * t, int d) { return t ? init_fastdiv_values(t->ne[d]) : make_uint3(0, 0, 0); };
+    const ggml_cuda_kernel_launch_params params = {
+        dim3(x->ne[1], x->ne[2], x->ne[3]), dim3(Block, 1, 1), 32*sizeof(float), ctx.stream()};
+    const ggml_cuda_norm_mmq_bundle_store write = {{(block_q8_1_mmq *) images[0], (block_q8_1_mmq *) images[1], (block_q8_1_mmq *) images[2]}, cols, padded, rows};
+    ggml_cuda_kernel_launch(rms_norm_mmq_multi_f32<Block, Multiply, Add, Scale>, params,
+        (const float *) x->data, (float *) dst->data, int(x->ne[0]), stride(x, 1), stride(x, 2), stride(x, 3),
+        ggml_get_op_params_f32(norm, 0), write,
+        pointer(weight), stride(weight, 1), stride(weight, 2), stride(weight, 3),
+        divisor(weight, 0), divisor(weight, 1), divisor(weight, 2), divisor(weight, 3),
+        pointer(bias), stride(bias, 1), stride(bias, 2), stride(bias, 3),
+        divisor(bias, 0), divisor(bias, 1), divisor(bias, 2), divisor(bias, 3),
+        scale ? ggml_get_op_params_f32(scale, 0) : 1.0f);
+}
+
+template <bool Multiply, bool Add, bool Scale>
+static void ggml_cuda_rms_norm_mmq_multi(ggml_backend_cuda_context & ctx, ggml_tensor * norm,
+        ggml_tensor * mul, ggml_tensor * add, ggml_tensor * scale, void * const images[3], int64_t cols, int64_t padded, int64_t rows) {
+    if (norm->src[0]->ne[0] < 1024) {
+        ggml_cuda_rms_norm_mmq_multi_launch<256, Multiply, Add, Scale>(ctx, norm, mul, add, scale, images, cols, padded, rows);
+    } else {
+        ggml_cuda_rms_norm_mmq_multi_launch<1024, Multiply, Add, Scale>(ctx, norm, mul, add, scale, images, cols, padded, rows);
+    }
+}
+
+void ggml_cuda_op_rms_norm_mmq_multi(ggml_backend_cuda_context & ctx, ggml_tensor * norm,
+        ggml_tensor * mul, ggml_tensor * add, ggml_tensor * scale, void * const images[3], int64_t cols, int64_t padded, int64_t rows) {
+    GGML_ASSERT(ggml_get_op_params_f32(norm, 0) >= 0.0f);
+    if (add) { ggml_cuda_rms_norm_mmq_multi<true, true, false>(ctx, norm, mul, add, scale, images, cols, padded, rows); }
+    else if (mul) { ggml_cuda_rms_norm_mmq_multi<true, false, false>(ctx, norm, mul, add, scale, images, cols, padded, rows); }
+    else if (scale) { ggml_cuda_rms_norm_mmq_multi<false, false, true>(ctx, norm, mul, add, scale, images, cols, padded, rows); }
+    else { ggml_cuda_rms_norm_mmq_multi<false, false, false>(ctx, norm, mul, add, scale, images, cols, padded, rows); }
+}
+
+template <mmq_q8_1_ds_layout Layout, bool Multi = false>
+static void ggml_cuda_hc_post_norm_emit_mmq_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * scale, void * f16, void * bf16, void * image, int64_t cols, int64_t padded, int64_t rows, void * const images[3] = nullptr) {
     const ggml_tensor * x = post->src[0];
     const ggml_tensor * residual = post->src[1];
     const ggml_tensor * weights = post->src[2];
@@ -1876,16 +2019,24 @@ static void ggml_cuda_hc_post_norm_emit_mmq_dispatch(ggml_backend_cuda_context &
     const dim3 grid(norm->ne[1], norm->ne[2], norm->ne[3]);
     const ggml_cuda_kernel_launch_params launch(grid, dim3(block_size), 32*sizeof(float), ctx.stream());
     const int layout = a.ncols == a.n_embd ? 1 : a.ncols == a.n_embd*a.hc ? 2 : 0;
+    const auto emit = [&](auto kernel, float factor, auto scaled) {
+        if constexpr (Multi) {
+            const ggml_cuda_hc_norm_mmq_bundle_store<decltype(scaled)::value> write = {
+                {(block_q8_1_mmq *) images[0], (block_q8_1_mmq *) images[1], (block_q8_1_mmq *) images[2]},
+                init_fastdiv_values(cols), padded, rows, (half *) f16, (nv_bfloat16 *) bf16, factor};
+            ggml_cuda_kernel_launch(kernel, launch, a, write);
+        } else { ggml_cuda_kernel_launch(kernel, launch, a, (half *) f16, (nv_bfloat16 *) bf16, image, init_fastdiv_values(cols), padded, rows, factor); }
+    };
     if (scale) {
         auto kernel = block_size == 256
-            ? (comb ? hc_post_norm_emit_mmq_kernel<Layout, 256, true, false, true>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 256, false, false, true>(layout))
-            : (comb ? hc_post_norm_emit_mmq_kernel<Layout, 1024, true, false, true>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 1024, false, false, true>(layout));
-        ggml_cuda_kernel_launch(kernel, launch, a, (half *) f16, (nv_bfloat16 *) bf16, image, init_fastdiv_values(cols), padded, rows, ggml_get_op_params_f32(scale, 0));
+            ? (comb ? hc_post_norm_emit_mmq_kernel<Layout, 256, true, false, true, Multi>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 256, false, false, true, Multi>(layout))
+            : (comb ? hc_post_norm_emit_mmq_kernel<Layout, 1024, true, false, true, Multi>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 1024, false, false, true, Multi>(layout));
+        emit(kernel, ggml_get_op_params_f32(scale, 0), std::true_type{});
     } else {
         auto kernel = block_size == 256
-            ? (comb ? (mul ? hc_post_norm_emit_mmq_kernel<Layout, 256, true, true, false>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 256, true, false, false>(layout)) : (mul ? hc_post_norm_emit_mmq_kernel<Layout, 256, false, true, false>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 256, false, false, false>(layout)))
-            : (comb ? (mul ? hc_post_norm_emit_mmq_kernel<Layout, 1024, true, true, false>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 1024, true, false, false>(layout)) : (mul ? hc_post_norm_emit_mmq_kernel<Layout, 1024, false, true, false>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 1024, false, false, false>(layout)));
-        ggml_cuda_kernel_launch(kernel, launch, a, (half *) f16, (nv_bfloat16 *) bf16, image, init_fastdiv_values(cols), padded, rows, 1.0f);
+            ? (comb ? (mul ? hc_post_norm_emit_mmq_kernel<Layout, 256, true, true, false, Multi>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 256, true, false, false, Multi>(layout)) : (mul ? hc_post_norm_emit_mmq_kernel<Layout, 256, false, true, false, Multi>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 256, false, false, false, Multi>(layout)))
+            : (comb ? (mul ? hc_post_norm_emit_mmq_kernel<Layout, 1024, true, true, false, Multi>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 1024, true, false, false, Multi>(layout)) : (mul ? hc_post_norm_emit_mmq_kernel<Layout, 1024, false, true, false, Multi>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 1024, false, false, false, Multi>(layout)));
+        emit(kernel, 1.0f, std::false_type{});
     }
 }
 
@@ -1896,6 +2047,13 @@ void ggml_cuda_op_hc_post_norm_emit_mmq(ggml_backend_cuda_context & ctx, ggml_te
         case MMQ_Q8_1_DS_LAYOUT_D2S6: ggml_cuda_hc_post_norm_emit_mmq_dispatch<MMQ_Q8_1_DS_LAYOUT_D2S6>(ctx, post, norm, mul, scale, f16, bf16, image, cols, padded, rows); break;
         default: GGML_ABORT("unsupported MMQ image layout");
     }
+}
+
+void ggml_cuda_op_hc_post_norm_emit_mmq_multi(ggml_backend_cuda_context & ctx, ggml_tensor * post,
+        ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * scale, void * f16, void * bf16,
+        void * const images[3], int64_t cols, int64_t padded, int64_t rows) {
+    ggml_cuda_hc_post_norm_emit_mmq_dispatch<MMQ_Q8_1_DS_LAYOUT_D4, true>(
+        ctx, post, norm, mul, scale, f16, bf16, nullptr, cols, padded, rows, images);
 }
 
 struct hc_injection_data {
@@ -2406,7 +2564,12 @@ void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tens
         const float factor = ggml_get_op_params_f32(scale, 0);
         void * f16 = emit ? emit->f16 : nullptr;
         void * bf16 = emit ? emit->bf16 : nullptr;
-        if (emit && emit->mmq) {
+        if (emit && (emit->mmq_images[0] || emit->mmq_images[1] || emit->mmq_images[2])) {
+            const ggml_cuda_hc_norm_mmq_bundle_store<true> write = {
+                {(block_q8_1_mmq *) emit->mmq_images[0], (block_q8_1_mmq *) emit->mmq_images[1], (block_q8_1_mmq *) emit->mmq_images[2]},
+                init_fastdiv_values(emit->cols), emit->padded, emit->rows, (half *) f16, (nv_bfloat16 *) bf16, factor};
+            ggml_cuda_hc_affine_emit_launch<false>(ctx, a, g, norm, comb, false, write);
+        } else if (emit && emit->mmq) {
             const uint3 cols = init_fastdiv_values(emit->cols);
             const auto launch = [&](auto write) { ggml_cuda_hc_affine_emit_launch<false>(ctx, a, g, norm, comb, false, write); };
             switch (emit->layout) {
@@ -2426,7 +2589,12 @@ void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tens
     if (emit) {
         GGML_ASSERT(norm);
         const uint3 cols = init_fastdiv_values(emit->cols);
-        if (emit->mmq) {
+        if (emit->mmq_images[0] || emit->mmq_images[1] || emit->mmq_images[2]) {
+            const ggml_cuda_hc_norm_mmq_bundle_store<false> write = {
+                {(block_q8_1_mmq *) emit->mmq_images[0], (block_q8_1_mmq *) emit->mmq_images[1], (block_q8_1_mmq *) emit->mmq_images[2]},
+                cols, emit->padded, emit->rows, (half *) emit->f16, (nv_bfloat16 *) emit->bf16, 1.0f};
+            ggml_cuda_hc_affine_emit_launch(ctx, a, g, norm, comb, mul, write);
+        } else if (emit->mmq) {
             const auto launch_mmq = [&](auto write) { ggml_cuda_hc_affine_emit_launch(ctx, a, g, norm, comb, mul, write); };
             switch (emit->layout) {
                 case MMQ_Q8_1_DS_LAYOUT_D4: launch_mmq(ggml_cuda_hc_norm_emit_mmq_pair_store<MMQ_Q8_1_DS_LAYOUT_D4, false>{(block_q8_1_mmq *) emit->mmq, cols, emit->padded, emit->rows, (half *) emit->f16, (nv_bfloat16 *) emit->bf16, 1.0f}); break;
