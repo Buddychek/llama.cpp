@@ -4267,6 +4267,7 @@ static std::vector<ggml_cuda_norm_emit_match> ggml_cuda_plan_norm_emit(ggml_cgra
 }
 
 struct ggml_cuda_norm_q8_match {
+    ggml_tensor * hc_pre = nullptr;
     ggml_tensor * post = nullptr;
     ggml_tensor * norm = nullptr;
     ggml_tensor * mul = nullptr;
@@ -4278,6 +4279,12 @@ struct ggml_cuda_norm_q8_match {
 };
 
 static ggml_cuda_norm_q8_match ggml_cuda_match_norm_q8(ggml_cgraph * graph, int i, int device) {
+    if (ggml_cuda_hc_pre_emit_ok(graph->nodes[i], device) && graph->nodes[i]->ne[0]%QK8_1 == 0) {
+        ggml_cuda_norm_q8_match match;
+        match.hc_pre = match.dst = graph->nodes[i];
+        match.last = i;
+        return match;
+    }
     if (graph->nodes[i]->op == GGML_OP_DSV4_HC_POST) {
         const auto hc = ggml_cuda_match_hc_post_norm(graph, i);
         if (!hc.count || hc.norm->ne[0] % QK8_1 || !ggml_cuda_hc_post_norm_memory_ok(graph, i, hc, device)) { return {}; }
@@ -4328,7 +4335,7 @@ static ggml_cuda_norm_q8_match ggml_cuda_match_norm_q8(ggml_cgraph * graph, int 
 }
 
 static std::vector<ggml_cuda_norm_q8_match> ggml_cuda_plan_norm_q8(ggml_cgraph * graph, int device,
-        const std::vector<int> & keys, const std::vector<size_t> & sizes, ggml_cuda_reuse_plan & reuse) {
+        const std::vector<int> & keys, const std::vector<size_t> & sizes, ggml_cuda_reuse_plan & reuse, const std::unordered_set<const ggml_tensor *> & hc_up) {
     std::unordered_map<const ggml_tensor *, std::vector<int>> readers;
     for (int i = 0; i < graph->n_nodes; ++i) {
         if (keys[i] < 0) { continue; }
@@ -4340,8 +4347,9 @@ static std::vector<ggml_cuda_norm_q8_match> ggml_cuda_plan_norm_q8(ggml_cgraph *
     bool moved = false;
     std::vector<bool> removed(reuse.groups.size(), false);
     for (int i = 0; i < graph->n_nodes; ++i) {
+        if (hc_up.count(graph->nodes[i])) { continue; }
         auto match = ggml_cuda_match_norm_q8(graph, i, device);
-        if (!match.norm) { continue; }
+        if (!match.norm && !match.hc_pre) { continue; }
         const auto can_emit = [&](int node, int prepare) {
             const ggml_tensor * input = graph->nodes[node]->src[1];
             const ggml_tensor * root = input->view_src ? input->view_src : input;
@@ -7155,7 +7163,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_reuse_plan q8_reuse(cgraph, stream_ctx, mmvq_keys, mmvq_sizes, ggml_cuda_mmvq_input_overwritten);
             std::vector<ggml_cuda_norm_q8_match> q8_emits;
             if (!disable_reuse && stream_ctx.concurrent_events.empty()) {
-                q8_emits = ggml_cuda_plan_norm_q8(cgraph, cuda_ctx->device, mmvq_keys, mmvq_sizes, q8_reuse);
+                q8_emits = ggml_cuda_plan_norm_q8(cgraph, cuda_ctx->device, mmvq_keys, mmvq_sizes, q8_reuse, hc_up);
             }
             ggml_cuda_reuse_inputs<ggml_cuda_pool_alloc<char>> q8_inputs(cuda_ctx->pool(), q8_reuse);
             const auto prepare_q8_group = [&](int group) {
@@ -7417,6 +7425,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     ggml_cuda_op_hc_affine_injection(*cuda_ctx, affine.mul, affine.add, affine.unary, affine.post ? affine.post : affine.unary,
                         affine_injection.post, affine_injection.hc.norm, affine_injection.hc.mul, &data, affine_injection.hc.scale);
                 };
+                if (!q8_emits.empty() && q8_emits[i].hc_pre) {
+                    ggml_cuda_hc_pre_emit_data images;
+                    if (!norm_emits.empty() && norm_emits[i].hc_pre) {
+                        const auto typed_image = [&](int g) -> void * {
+                            if (g < 0) { return nullptr; }
+                            shared_inputs[g].alloc(input_sizes[reuse.groups[g].node]);
+                            return shared_inputs[g].get();
+                        };
+                        images.f16 = typed_image(norm_emits[i].f16);
+                        images.bf16 = typed_image(norm_emits[i].bf16);
+                    }
+                    const int g = q8_emits[i].image;
+                    const ggml_tensor * input = cgraph->nodes[q8_reuse.groups[g].node]->src[1];
+                    q8_inputs[g].alloc(mmvq_sizes[q8_reuse.groups[g].node]);
+                    ggml_cuda_op_dsv4_hc_pre_q8(*cuda_ctx, node, q8_inputs[g].get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), images);
+                    continue;
+                }
                 if (!norm_emits.empty() && norm_emits[i].hc_pre) {
                     ggml_cuda_hc_pre_emit_data images;
                     const auto typed_image = [&](int g) -> void * {

@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "dsv4-hc.cuh"
 #include "convert.cuh"
+#include "quantize.cuh"
 
 
 static constexpr int DSV4_HC = 4;
@@ -132,6 +133,32 @@ struct ggml_cuda_hc_pre_image_store {
     }
 };
 
+template <bool Typed>
+struct ggml_cuda_hc_pre_q8_store {
+    block_q8_1 * image;
+    int64_t cols;
+    int64_t padded;
+    ggml_cuda_hc_pre_emit_data images;
+    __device__ __forceinline__ void operator()(float * dst, int64_t index, int64_t, int64_t, float value) const {
+        dst[index] = value;
+        if constexpr (Typed) {
+            if (images.f16) { ((half *) images.f16)[index] = ggml_cuda_cast<half>(value); }
+            if (images.bf16) { ((nv_bfloat16 *) images.bf16)[index] = ggml_cuda_cast<nv_bfloat16>(value); }
+        }
+        const int64_t row = index/cols, column = index%cols;
+        const int lane = column%QK8_1;
+        const int64_t block = (row*padded + column)/QK8_1;
+        ggml_cuda_store_q8_1(image[block], lane, value);
+        if (column/QK8_1 == cols/QK8_1 - 1) {
+            for (int64_t tail = cols/QK8_1; tail < padded/QK8_1; ++tail) {
+                block_q8_1 & zero = image[row*(padded/QK8_1) + tail];
+                zero.qs[lane] = 0;
+                if (lane == 0) { zero.ds = make_half2(0.0f, 0.0f); }
+            }
+        }
+    }
+};
+
 template <bool gated, typename Gate, typename Store = ggml_cuda_hc_pre_store>
 static __device__ __forceinline__ void dsv4_hc_pre_impl(
         const float * x,
@@ -208,6 +235,28 @@ static __global__ void dsv4_hc_pre_images(
         int64_t sd0, int64_t sd1, float scale, ggml_cuda_hc_pre_emit_data images) {
     dsv4_hc_pre_impl<gated>(x, ggml_cuda_hc_gate_f32{weights}, dst, n_embd, hc, n_tokens,
         sx0, sx1, sx2, sw0, sw1, sw2, sd0, sd1, scale, ggml_cuda_hc_pre_image_store{images, n_embd});
+}
+
+template <bool gated, bool Typed>
+static __global__ void dsv4_hc_pre_q8(
+        const float * x,
+        const float * weights,
+        float * dst,
+        int64_t n_embd,
+        int64_t hc,
+        int64_t n_tokens,
+        int64_t sx0,
+        int64_t sx1,
+        int64_t sx2,
+        int64_t sw0,
+        int64_t sw1,
+        int64_t sw2,
+        int64_t sd0,
+        int64_t sd1,
+        float   scale, ggml_cuda_hc_pre_q8_store<Typed> write) {
+    dsv4_hc_pre_impl<gated>(
+            x, ggml_cuda_hc_gate_f32{weights}, dst, n_embd, hc, n_tokens,
+            sx0, sx1, sx2, sw0, sw1, sw2, sd0, sd1, scale, write);
 }
 
 template <typename T>
@@ -360,6 +409,26 @@ void ggml_cuda_op_dsv4_hc_pre_emit(ggml_backend_cuda_context & ctx, ggml_tensor 
         x->ne[0], x->ne[1], x->ne[2], x->nb[0]/sizeof(float), x->nb[1]/sizeof(float), x->nb[2]/sizeof(float),
         weights->nb[0]/sizeof(float), weights->nb[1]/sizeof(float), weights->nb[2]/sizeof(float),
         dst->nb[0]/sizeof(float), dst->nb[1]/sizeof(float), ggml_get_op_params_f32(dst, 0), images);
+}
+
+template <bool Typed>
+static void ggml_cuda_hc_pre_q8_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * image, int64_t cols, int64_t padded, const ggml_cuda_hc_pre_emit_data & images) {
+    const ggml_tensor * x = dst->src[0], * weight = dst->src[1];
+    GGML_ASSERT(image && ggml_is_contiguous(dst) && dst->ne[0]%QK8_1 == 0 && cols%QK8_1 == 0);
+    const int64_t count = ggml_nelements(dst);
+    const ggml_cuda_kernel_launch_params params = {dim3((count + 255)/256, 1, 1), dim3(256, 1, 1), 0, ctx.stream()};
+    auto kernel = ggml_get_op_params_i32(dst, 1) ? dsv4_hc_pre_q8<true, Typed> : dsv4_hc_pre_q8<false, Typed>;
+    ggml_cuda_kernel_launch(kernel, params,
+        (const float *) x->data, (const float *) weight->data, (float *) dst->data, x->ne[0], x->ne[1], x->ne[2],
+        x->nb[0]/sizeof(float), x->nb[1]/sizeof(float), x->nb[2]/sizeof(float),
+        weight->nb[0]/sizeof(float), weight->nb[1]/sizeof(float), weight->nb[2]/sizeof(float),
+        dst->nb[0]/sizeof(float), dst->nb[1]/sizeof(float), ggml_get_op_params_f32(dst, 0),
+        ggml_cuda_hc_pre_q8_store<Typed>{(block_q8_1 *) image, cols, padded, images});
+}
+
+void ggml_cuda_op_dsv4_hc_pre_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * image, int64_t cols, int64_t padded, const ggml_cuda_hc_pre_emit_data & images) {
+    if (images.f16 || images.bf16) { ggml_cuda_hc_pre_q8_launch<true>(ctx, dst, image, cols, padded, images); }
+    else { ggml_cuda_hc_pre_q8_launch<false>(ctx, dst, image, cols, padded, images); }
 }
 
 void ggml_cuda_op_dsv4_hc_pre_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * weights, ggml_tensor * mm, ggml_tensor * dst) {

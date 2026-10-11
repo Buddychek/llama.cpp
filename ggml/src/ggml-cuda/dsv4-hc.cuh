@@ -15,3 +15,5 @@ struct ggml_cuda_hc_pre_emit_data {
 };
 
 void ggml_cuda_op_dsv4_hc_pre_emit(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_hc_pre_emit_data & images);
+
+void ggml_cuda_op_dsv4_hc_pre_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst, void * image, int64_t cols, int64_t padded, const ggml_cuda_hc_pre_emit_data & images);
