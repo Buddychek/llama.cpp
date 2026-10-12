@@ -3294,6 +3294,135 @@ static bool ggml_cuda_match_ssm_conv_qk(const ggml_cgraph * cgraph, int i, bool 
     return true;
 }
 
+
+struct ggml_cuda_ssm_conv_split_match {
+    int conv_idx;
+    int node_count;
+    int copies;
+    ggml_tensor * cache;
+    size_t cache_slot_stride;
+    size_t cache_seq_stride;
+    int64_t latest_start;
+};
+
+static bool ggml_cuda_match_ssm_conv_split(const ggml_cgraph * graph, int i, ggml_cuda_ssm_conv_split_match & match, bool check_memory = false) {
+    if (i < 0 || i >= graph->n_nodes) return false;
+    const ggml_tensor * input = graph->nodes[i];
+    if (input->op != GGML_OP_CONCAT || input->type != GGML_TYPE_F32 ||
+            ggml_get_op_params_i32(input, 0) != 0 || !ggml_is_contiguous(input)) return false;
+    const ggml_tensor * history = input->src[0], * current = input->src[1];
+    if (history->type != GGML_TYPE_F32 || current->type != GGML_TYPE_F32 ||
+            history->ne[3] != 1 || current->ne[3] != 1 || history->ne[1] != current->ne[1] ||
+            history->ne[2] != current->ne[2]) return false;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (history->nb[d] % sizeof(float) || current->nb[d] % sizeof(float)) return false;
+    }
+    std::vector<int> copies;
+    int conv_idx = i + 1;
+    for (; conv_idx < graph->n_nodes; ++conv_idx) {
+        const auto op = graph->nodes[conv_idx]->op;
+        if (op == GGML_OP_CPY) copies.push_back(conv_idx);
+        else if (op != GGML_OP_VIEW && op != GGML_OP_RESHAPE && op != GGML_OP_TRANSPOSE && op != GGML_OP_PERMUTE) break;
+    }
+    if (conv_idx >= graph->n_nodes || graph->nodes[conv_idx]->op != GGML_OP_SSM_CONV ||
+            graph->nodes[conv_idx]->src[0] != input ||
+            !ggml_cuda_match_ssm_conv_qk(graph, conv_idx, false)) return false;
+    const int64_t history_width = history->ne[0], channels = history->ne[1], sequences = history->ne[2];
+    if (history_width != graph->nodes[conv_idx]->src[1]->ne[0] - 1) return false;
+    ggml_tensor * cache = nullptr;
+    size_t seq_stride = 0, slot_stride = 0;
+    int64_t latest_start = 0;
+    if (!copies.empty()) {
+        const ggml_tensor * last = graph->nodes[copies.back()];
+        cache = last->src[1];
+        if (last->src[0]->view_offs % sizeof(float)) return false;
+        latest_start = last->src[0]->view_offs / sizeof(float);
+        const size_t row_bytes = history_width * channels * sizeof(float);
+        const auto cache_stride = [&](const ggml_tensor * dst) -> size_t {
+            if (dst->type != GGML_TYPE_F32 || dst->op != GGML_OP_VIEW || !dst->view_src ||
+                    dst->nb[0] != sizeof(float) || dst->ne[3] != 1) return 0;
+            if (dst->ne[0] == history_width * channels && dst->ne[1] == sequences && dst->ne[2] == 1) return dst->nb[1];
+            if (dst->ne[0] == history_width && dst->ne[1] == channels && dst->ne[2] == sequences &&
+                    dst->nb[1] == history_width * sizeof(float)) return dst->nb[2];
+            return 0;
+        };
+        seq_stride = cache_stride(cache);
+        if (seq_stride < row_bytes || seq_stride % sizeof(float) || latest_start > current->ne[0]) return false;
+        if (copies.size() > 1) {
+            const ggml_tensor * prev = graph->nodes[copies[copies.size() - 2]]->src[1];
+            if (prev->view_offs <= cache->view_offs) return false;
+            slot_stride = prev->view_offs - cache->view_offs;
+            if (size_t(sequences - 1) > (SIZE_MAX - row_bytes)/seq_stride ||
+                    copies.size() - 1 > (SIZE_MAX - cache->view_offs)/slot_stride) return false;
+            if (slot_stride < size_t(sequences - 1) * seq_stride + row_bytes || slot_stride % sizeof(float)) return false;
+        }
+        for (size_t k = 0; k < copies.size(); ++k) {
+            const ggml_tensor * copy = graph->nodes[copies[k]];
+            const ggml_tensor * src = copy->src[0], * dst = copy->src[1];
+            const size_t slot = copies.size() - 1 - k;
+            const int64_t start = std::max<int64_t>(0, latest_start - int64_t(slot));
+            if (src->op != GGML_OP_VIEW || src->view_src != input || src->type != GGML_TYPE_F32 ||
+                    src->ne[0] != history_width || src->ne[1] != channels || src->ne[2] != sequences || src->ne[3] != 1 ||
+                    src->view_offs != size_t(start) * sizeof(float) || src->nb[0] != sizeof(float) ||
+                    src->nb[1] != input->nb[1] || src->nb[2] != input->nb[2] ||
+                    dst->view_src != cache->view_src || dst->view_offs != cache->view_offs + slot * slot_stride ||
+                    cache_stride(dst) != seq_stride) return false;
+        }
+    }
+    const int last = conv_idx + 7;
+    std::vector<int> indices;
+    std::vector<ggml_op> ops;
+    std::vector<int> outputs = copies;
+    for (int j = i; j <= last; ++j) { indices.push_back(j); ops.push_back(graph->nodes[j]->op); }
+    const auto is_view = [](ggml_op op) {
+        return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_TRANSPOSE || op == GGML_OP_PERMUTE;
+    };
+    for (int j = i; j <= last; ++j) {
+        const ggml_tensor * node = graph->nodes[j];
+        bool weight_view = false;
+        for (const ggml_tensor * w = graph->nodes[conv_idx]->src[1]; w && is_view(w->op); w = w->src[0]) {
+            if (w == node) weight_view = true;
+        }
+        if (weight_view) { outputs.push_back(j); continue; }
+        if (node->op != GGML_OP_VIEW) continue;
+        for (int copy : copies) {
+            if (graph->nodes[copy]->src[1] == graph->nodes[j]) {
+                outputs.push_back(j);
+                break;
+            }
+        }
+    }
+    outputs.push_back(conv_idx + 1); outputs.push_back(conv_idx + 4); outputs.push_back(conv_idx + 7);
+    if (!ggml_can_fuse_subgraph_ext(graph, indices.data(), indices.size(), ops.data(), outputs.data(), outputs.size())) return false;
+    if (check_memory) {
+        if (!ggml_cuda_match_ssm_conv_qk(graph, conv_idx, true)) return false;
+        const ggml_tensor * weight = graph->nodes[conv_idx]->src[1];
+        const ggml_tensor * reads[] = { history, current, weight };
+        std::vector<const ggml_tensor *> writes;
+        for (int copy : copies) writes.push_back(graph->nodes[copy]->src[1]);
+        for (int offset : { 1, 4, 7 }) writes.push_back(graph->nodes[conv_idx + offset]);
+        const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            const uintptr_t a0 = (uintptr_t) a->data, b0 = (uintptr_t) b->data;
+            return a0 <= b0 ? b0 - a0 < ggml_nbytes(a) : a0 - b0 < ggml_nbytes(b);
+        };
+        for (const auto * read : reads) {
+            if (!read->data || !read->buffer) return false;
+        }
+        for (size_t j = 0; j < writes.size(); ++j) {
+            const auto * out = writes[j];
+            if (!out->data || !out->buffer) return false;
+            for (const auto * read : reads) {
+                if (overlap(out, read)) return false;
+            }
+            for (size_t k = 0; k < j; ++k) {
+                if (overlap(out, writes[k])) return false;
+            }
+        }
+    }
+    match = {conv_idx, last + 1 - i, int(copies.size()), cache, slot_stride, seq_stride, latest_start};
+    return true;
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -4290,6 +4419,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    ggml_cuda_ssm_conv_split_match split_match;
+    if (node->op == GGML_OP_CONCAT && cuda_ctx->stream_context().concurrent_events.empty() &&
+            ggml_cuda_match_ssm_conv_split(cgraph, i, split_match, true)) {
+        const int j = split_match.conv_idx;
+        ggml_cuda_op_ssm_conv_qk_split(*cuda_ctx, cgraph->nodes[j], cgraph->nodes[j + 1], cgraph->nodes[j + 3],
+            cgraph->nodes[j + 4], cgraph->nodes[j + 6], cgraph->nodes[j + 7], split_match.cache,
+            split_match.cache_slot_stride, split_match.cache_seq_stride, split_match.copies, split_match.latest_start);
+        return split_match.node_count - 1;
+    }
+
     if (node->op == GGML_OP_SSM_CONV && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_ssm_conv_qk(cgraph, i, true)) {
         ggml_cuda_op_ssm_conv_qk(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 3],
@@ -4668,6 +4807,17 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_ssm_conv_split_match split_match;
+            if (cgraph->nodes[i]->op == GGML_OP_CONCAT && ggml_cuda_match_ssm_conv_split(cgraph, i, split_match)) {
+                const int j = split_match.conv_idx;
+                ggml_tensor * last = cgraph->nodes[j + 7];
+                params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[0], last);
+                params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[1], last);
+                params->add_alloc_dep(params->user_data, cgraph->nodes[j]->src[1], last);
+                params->add_alloc_dep(params->user_data, cgraph->nodes[j + 1], last);
+                params->add_alloc_dep(params->user_data, cgraph->nodes[j + 4], last);
+                if (split_match.cache) params->add_alloc_dep(params->user_data, split_match.cache, last);
+            }
             if (cgraph->nodes[i]->op == GGML_OP_SSM_CONV && ggml_cuda_match_ssm_conv_qk(cgraph, i)) {
                 ggml_tensor * last = cgraph->nodes[i + 7];
                 params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[0], last);
