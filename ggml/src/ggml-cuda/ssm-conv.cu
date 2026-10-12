@@ -204,3 +204,59 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
 }
+
+template <typename T>
+static __global__ void dilated_conv_f32(const float * x, const T * weights, const float * residual0, const float * residual1,
+                                      float * dst, uint32_t count, uint3 div_channels, uint3 div_tokens, int taps,
+                                      int64_t stride_channel, int64_t stride_sequence, int64_t stride_weight,
+                                      int64_t first_row, int64_t dilation, bool apply_silu, int other_first) {
+    ggml_cuda_pdl_lc();
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) {
+        return;
+    }
+    const uint2 channel = fast_div_modulo(i, div_channels);
+    const uint2 token = fast_div_modulo(channel.x, div_tokens);
+    const float * row = x + channel.y * stride_channel + token.x * stride_sequence + first_row + token.y;
+    const T * column = weights + channel.y * stride_weight;
+    ggml_cuda_pdl_sync();
+    float sum = __fmul_rn(row[0], float(column[0]));
+    for (int tap = 1; tap < taps; ++tap) {
+        sum = __fadd_rn(sum, __fmul_rn(row[tap * dilation], float(column[tap])));
+    }
+    if (apply_silu) {
+        sum = ggml_cuda_op_silu_single(sum);
+    }
+    if (residual0) {
+        sum = other_first & 1 ? __fadd_rn(residual0[i], sum) : __fadd_rn(sum, residual0[i]);
+    }
+    if (residual1) {
+        sum = other_first & 2 ? __fadd_rn(residual1[i], sum) : __fadd_rn(sum, residual1[i]);
+    }
+    dst[i] = sum;
+}
+
+void ggml_cuda_op_dilated_conv(ggml_backend_cuda_context & ctx, const ggml_cuda_dilated_conv_args & args) {
+    const ggml_tensor * source = args.source;
+    const ggml_tensor * weights = args.weights;
+    const float * x = (const float *) source->data;
+    const float * r0 = args.residual[0] ? (const float *) args.residual[0]->data : nullptr;
+    const float * r1 = args.residual[1] ? (const float *) args.residual[1]->data : nullptr;
+    float * dst = (float *) args.dst->data;
+    const uint32_t count = ggml_nelements(args.dst);
+    const uint3 channels = init_fastdiv_values(source->ne[1]);
+    const uint3 tokens = init_fastdiv_values(count / (source->ne[1] * source->ne[2]));
+    const int blocks = (count + 255) / 256;
+    const int64_t stride_weight = weights->nb[1] / ggml_element_size(weights);
+    const int64_t stride_channel = source->nb[1] / sizeof(float);
+    const int64_t stride_sequence = source->nb[2] / sizeof(float);
+    const cudaStream_t stream = ctx.stream();
+    if (weights->type == GGML_TYPE_F32) {
+        dilated_conv_f32<<<blocks, 256, 0, stream>>>(x, (const float *) weights->data, r0, r1, dst, count, channels, tokens, weights->ne[0], stride_channel, stride_sequence, stride_weight, args.first_row, args.dilation, args.apply_silu, args.other_first);
+    } else if (weights->type == GGML_TYPE_F16) {
+        dilated_conv_f32<<<blocks, 256, 0, stream>>>(x, (const half *) weights->data, r0, r1, dst, count, channels, tokens, weights->ne[0], stride_channel, stride_sequence, stride_weight, args.first_row, args.dilation, args.apply_silu, args.other_first);
+    } else {
+        GGML_ASSERT(weights->type == GGML_TYPE_BF16);
+        dilated_conv_f32<<<blocks, 256, 0, stream>>>(x, (const nv_bfloat16 *) weights->data, r0, r1, dst, count, channels, tokens, weights->ne[0], stride_channel, stride_sequence, stride_weight, args.first_row, args.dilation, args.apply_silu, args.other_first);
+    }
+}
