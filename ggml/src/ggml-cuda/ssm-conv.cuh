@@ -25,3 +25,12 @@ struct ggml_cuda_dilated_conv_history_args {
 };
 
 void ggml_cuda_op_dilated_conv_history(ggml_backend_cuda_context & ctx, const ggml_cuda_dilated_conv_history_args & args);
+
+struct ggml_cuda_dilated_conv_outputs {
+    ggml_tensor * nodes[5] = {};
+    int value[5] = {};
+    int count = 0;
+};
+
+void ggml_cuda_op_dilated_conv_outputs(ggml_backend_cuda_context & ctx, const ggml_cuda_dilated_conv_args & conv,
+                                      const ggml_cuda_dilated_conv_outputs & outputs, const ggml_cuda_dilated_conv_history_args * history = nullptr);
