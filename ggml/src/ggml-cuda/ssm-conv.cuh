@@ -14,3 +14,14 @@ struct ggml_cuda_dilated_conv_args {
 };
 
 void ggml_cuda_op_dilated_conv(ggml_backend_cuda_context & ctx, const ggml_cuda_dilated_conv_args & args);
+
+struct ggml_cuda_dilated_conv_history_args {
+    ggml_cuda_dilated_conv_args conv;
+    const ggml_tensor * history;
+    const ggml_tensor * current;
+    ggml_tensor * state;
+    int slots;
+    int64_t slot_stride;
+};
+
+void ggml_cuda_op_dilated_conv_history(ggml_backend_cuda_context & ctx, const ggml_cuda_dilated_conv_history_args & args);

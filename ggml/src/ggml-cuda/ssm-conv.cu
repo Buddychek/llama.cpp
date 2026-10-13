@@ -260,3 +260,109 @@ void ggml_cuda_op_dilated_conv(ggml_backend_cuda_context & ctx, const ggml_cuda_
         dilated_conv_f32<<<blocks, 256, 0, stream>>>(x, (const nv_bfloat16 *) weights->data, r0, r1, dst, count, channels, tokens, weights->ne[0], stride_channel, stride_sequence, stride_weight, args.first_row, args.dilation, args.apply_silu, args.other_first);
     }
 }
+
+struct dilated_conv_history_params {
+    const float * old;
+    const float * current;
+    const void * weights;
+    const float * residual0;
+    const float * residual1;
+    float * dst;
+    float * state;
+    uint32_t count, state_count;
+    int taps, history, tokens, channels, sequences, slots;
+    int64_t old_stride[3], current_stride[3];
+    int64_t weight_stride, state_sequence_stride, slot_stride, first_row, dilation;
+    uint3 div_channels, div_tokens, div_history, div_sequences;
+    bool apply_silu;
+    int other_first;
+};
+
+static __device__ __forceinline__ float dilated_conv_history_read(const dilated_conv_history_params & p, int64_t row, int channel, int sequence) {
+    if (row < p.history) {
+        return p.old[row * p.old_stride[0] + channel * p.old_stride[1] + sequence * p.old_stride[2]];
+    }
+    return p.current[(row - p.history) * p.current_stride[0] + channel * p.current_stride[1] + sequence * p.current_stride[2]];
+}
+
+template <typename T>
+static __global__ void dilated_conv_history_f32(dilated_conv_history_params p) {
+    ggml_cuda_pdl_lc();
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= p.count && i >= p.state_count) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+    if (i < p.count) {
+        const uint2 channel = fast_div_modulo(i, p.div_channels);
+        const uint2 token = fast_div_modulo(channel.x, p.div_tokens);
+        const T * column = (const T *) p.weights + channel.y * p.weight_stride;
+        const int64_t row = p.first_row + token.y;
+        float sum = __fmul_rn(dilated_conv_history_read(p, row, channel.y, token.x), float(column[0]));
+        for (int tap = 1; tap < p.taps; ++tap) {
+            sum = __fadd_rn(sum, __fmul_rn(dilated_conv_history_read(p, row + tap * p.dilation, channel.y, token.x), float(column[tap])));
+        }
+        if (p.apply_silu) {
+            sum = ggml_cuda_op_silu_single(sum);
+        }
+        if (p.residual0) {
+            sum = p.other_first & 1 ? __fadd_rn(p.residual0[i], sum) : __fadd_rn(sum, p.residual0[i]);
+        }
+        if (p.residual1) {
+            sum = p.other_first & 2 ? __fadd_rn(p.residual1[i], sum) : __fadd_rn(sum, p.residual1[i]);
+        }
+        p.dst[i] = sum;
+    }
+    if (i < p.state_count) {
+        const uint2 row = fast_div_modulo(i, p.div_history);
+        const uint2 channel = fast_div_modulo(row.x, p.div_channels);
+        const uint2 sequence = fast_div_modulo(channel.x, p.div_sequences);
+        const int advance = sequence.x < p.tokens ? p.tokens - sequence.x : 0;
+        p.state[sequence.x * p.slot_stride + sequence.y * p.state_sequence_stride + channel.y * p.history + row.y] =
+            dilated_conv_history_read(p, advance + row.y, channel.y, sequence.y);
+    }
+}
+
+void ggml_cuda_op_dilated_conv_history(ggml_backend_cuda_context & ctx, const ggml_cuda_dilated_conv_history_args & args) {
+    const auto & conv = args.conv;
+    dilated_conv_history_params p = {};
+    p.old = (const float *) args.history->data;
+    p.current = (const float *) args.current->data;
+    p.weights = conv.weights->data;
+    p.residual0 = conv.residual[0] ? (const float *) conv.residual[0]->data : nullptr;
+    p.residual1 = conv.residual[1] ? (const float *) conv.residual[1]->data : nullptr;
+    p.dst = (float *) conv.dst->data;
+    p.state = args.state ? (float *) args.state->data : nullptr;
+    p.count = ggml_nelements(conv.dst);
+    p.state_count = ggml_nelements(args.history) * args.slots;
+    p.taps = conv.weights->ne[0];
+    p.history = args.history->ne[0];
+    p.tokens = args.current->ne[0];
+    p.channels = args.history->ne[1];
+    p.sequences = args.history->ne[2];
+    p.slots = args.slots;
+    for (int d = 0; d < 3; ++d) {
+        p.old_stride[d] = args.history->nb[d] / sizeof(float);
+        p.current_stride[d] = args.current->nb[d] / sizeof(float);
+    }
+    p.weight_stride = conv.weights->nb[1] / ggml_element_size(conv.weights);
+    p.state_sequence_stride = args.state ? args.state->nb[1] / sizeof(float) : 0;
+    p.slot_stride = args.slot_stride / sizeof(float);
+    p.first_row = conv.first_row;
+    p.dilation = conv.dilation;
+    p.div_channels = init_fastdiv_values(p.channels);
+    p.div_tokens = init_fastdiv_values(p.tokens);
+    p.div_history = init_fastdiv_values(p.history);
+    p.div_sequences = init_fastdiv_values(p.sequences);
+    p.apply_silu = conv.apply_silu;
+    p.other_first = conv.other_first;
+    const int blocks = (std::max(p.count, p.state_count) + 255) / 256;
+    if (conv.weights->type == GGML_TYPE_F32) {
+        dilated_conv_history_f32<float><<<blocks, 256, 0, ctx.stream()>>>(p);
+    } else if (conv.weights->type == GGML_TYPE_F16) {
+        dilated_conv_history_f32<half><<<blocks, 256, 0, ctx.stream()>>>(p);
+    } else {
+        GGML_ASSERT(conv.weights->type == GGML_TYPE_BF16);
+        dilated_conv_history_f32<nv_bfloat16><<<blocks, 256, 0, ctx.stream()>>>(p);
+    }
+}
