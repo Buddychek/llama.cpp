@@ -5517,6 +5517,7 @@ struct ggml_cuda_moe_shared_match {
     ggml_cuda_moe_weighted_reduction_match reduction;
     ggml_cuda_affine_unary_match binary;
     ggml_tensor * unary = nullptr;
+    bool unary_mul_fused = false;
     int first_tail = -1;
     int last_tail = -1;
 };
@@ -5547,16 +5548,15 @@ static ggml_cuda_moe_shared_match ggml_cuda_match_moe_shared(ggml_backend_cuda_c
                 {GGML_UNARY_OP_SIGMOID}) || ggml_cuda_can_fuse(graph, a - 2, {GGML_OP_UNARY, GGML_OP_MUL},
                 {GGML_UNARY_OP_SILU}) || ggml_cuda_can_fuse(graph, a - 2, {GGML_OP_UNARY, GGML_OP_MUL},
                 {GGML_UNARY_OP_SOFTPLUS});
-        if (!preserve_unary_mul) {
-            match.binary = binary;
+        match.unary_mul_fused = preserve_unary_mul;
+        match.binary = binary;
+        --match.first_tail;
+        if (unary->op == GGML_OP_UNARY && ((product->src[0] == unary) != (product->src[1] == unary))) {
+            const ggml_unary_op op = ggml_get_unary_op(unary);
+            if (!unary->src[0] || unary->type != unary->src[0]->type || !ggml_is_contiguous(unary) || !(match.unary_mul_fused ? ggml_is_contiguous_1(unary->src[0]) : ggml_is_contiguous(unary->src[0])) ||
+                    !ggml_are_same_shape(unary, unary->src[0]) || (op != GGML_UNARY_OP_SIGMOID && op != GGML_UNARY_OP_SILU && op != GGML_UNARY_OP_SOFTPLUS)) { return {}; }
+            match.unary = unary;
             --match.first_tail;
-            if (unary->op == GGML_OP_UNARY && ((product->src[0] == unary) != (product->src[1] == unary))) {
-                const ggml_unary_op op = ggml_get_unary_op(unary);
-                if (!unary->src[0] || unary->type != unary->src[0]->type || !ggml_is_contiguous(unary) || !ggml_is_contiguous(unary->src[0]) ||
-                        !ggml_are_same_shape(unary, unary->src[0]) || (op != GGML_UNARY_OP_SIGMOID && op != GGML_UNARY_OP_SILU && op != GGML_UNARY_OP_SOFTPLUS)) { return {}; }
-                match.unary = unary;
-                --match.first_tail;
-            }
         }
     }
     if (!match.binary.mul) {
@@ -7044,7 +7044,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     const auto shared_emit = moe_shared_emits.find(node);
                     if (shared_emit != moe_shared_emits.end()) {
                         const auto & match = shared_emit->second;
-                        ggml_cuda_op_moe_shared_combine(*cuda_ctx, match.reduction.experts, match.reduction.expert_scale, match.reduction.weights,
+                        const auto combine = match.unary_mul_fused ? ggml_cuda_op_moe_shared_combine_unary_mul : ggml_cuda_op_moe_shared_combine;
+                        combine(*cuda_ctx, match.reduction.experts, match.reduction.expert_scale, match.reduction.weights,
                             match.reduction.dst, match.unary, match.binary.mul, match.binary.add, match.reduction.experts->ne[1] > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS);
                         i = match.last_tail;
                         continue;

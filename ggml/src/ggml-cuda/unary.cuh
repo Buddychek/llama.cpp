@@ -95,6 +95,7 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 
 void ggml_cuda_op_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add);
 void ggml_cuda_op_moe_shared_combine(ggml_backend_cuda_context & ctx, const ggml_tensor * experts, const ggml_tensor * scale, const ggml_tensor * weights, ggml_tensor * routed, ggml_tensor * unary, ggml_tensor * mul, ggml_tensor * add, bool separate_products);
+void ggml_cuda_op_moe_shared_combine_unary_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * experts, const ggml_tensor * scale, const ggml_tensor * weights, ggml_tensor * routed, ggml_tensor * unary, ggml_tensor * mul, ggml_tensor * add, bool separate_products);
 void ggml_cuda_op_repeat_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * repeat, ggml_tensor * mul, ggml_tensor * add);
 
 void ggml_cuda_op_repeat_add(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * repeat0, ggml_tensor * repeat1);

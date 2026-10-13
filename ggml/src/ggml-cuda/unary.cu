@@ -488,7 +488,8 @@ void ggml_cuda_op_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * mul, gg
     ggml_cuda_kernel_launch(mul_add_kernel, launch, binary, add->src[0] == mul);
 }
 
-static __global__ void moe_shared_combine_kernel(const float * __restrict__ experts, const float * __restrict__ scale,
+template <bool FusedUnaryMul>
+static __device__ __forceinline__ void moe_shared_combine_impl(const float * __restrict__ experts, const float * __restrict__ scale,
         const float * __restrict__ weights, float * __restrict__ routed, int n_embd, int n_expert_used,
         mul_add_args binary, int unary_input, bool product_first, bool separate_products) {
     ggml_cuda_pdl_lc();
@@ -523,10 +524,12 @@ static __global__ void moe_shared_combine_kernel(const float * __restrict__ expe
     if (unary_input >= 0) {
         const float raw = unary_input == 0 ? lhs : rhs;
         float gate = args.op == GGML_UNARY_OP_SIGMOID ? op_sigmoid(raw) : args.op == GGML_UNARY_OP_SILU ? op_silu(raw) : op_softplus(raw);
-        if (args.output_type[2] == GGML_TYPE_F16) { gate = ggml_cuda_cast<float>(ggml_cuda_cast<half>(gate)); }
-        else if (args.output_type[2] == GGML_TYPE_BF16) { gate = ggml_cuda_cast<float>(ggml_cuda_cast<nv_bfloat16>(gate)); }
-        if (col < args.input[unary_input].ne[0] && token < args.input[unary_input].ne[1]) {
-            affine_unary_store(args.output[2], args.output_type[2], token*args.input[unary_input].ne[0] + col, gate);
+        if constexpr (!FusedUnaryMul) {
+            if (args.output_type[2] == GGML_TYPE_F16) { gate = ggml_cuda_cast<float>(ggml_cuda_cast<half>(gate)); }
+            else if (args.output_type[2] == GGML_TYPE_BF16) { gate = ggml_cuda_cast<float>(ggml_cuda_cast<nv_bfloat16>(gate)); }
+            if (col < args.input[unary_input].ne[0] && token < args.input[unary_input].ne[1]) {
+                affine_unary_store(args.output[2], args.output_type[2], token*args.input[unary_input].ne[0] + col, gate);
+            }
         }
         if (unary_input == 0) { lhs = gate; } else { rhs = gate; }
     }
@@ -535,7 +538,20 @@ static __global__ void moe_shared_combine_kernel(const float * __restrict__ expe
     affine_unary_store(args.output[1], args.output_type[1], i, value);
 }
 
-void ggml_cuda_op_moe_shared_combine(ggml_backend_cuda_context & ctx, const ggml_tensor * experts, const ggml_tensor * scale,
+static __global__ void moe_shared_combine_kernel(const float * __restrict__ experts, const float * __restrict__ scale,
+        const float * __restrict__ weights, float * __restrict__ routed, int n_embd, int n_expert_used,
+        mul_add_args binary, int unary_input, bool product_first, bool separate_products) {
+    moe_shared_combine_impl<false>(experts, scale, weights, routed, n_embd, n_expert_used, binary, unary_input, product_first, separate_products);
+}
+
+static __global__ void moe_shared_combine_unary_mul_kernel(const float * __restrict__ experts, const float * __restrict__ scale,
+        const float * __restrict__ weights, float * __restrict__ routed, int n_embd, int n_expert_used,
+        mul_add_args binary, int unary_input, bool product_first, bool separate_products) {
+    moe_shared_combine_impl<true>(experts, scale, weights, routed, n_embd, n_expert_used, binary, unary_input, product_first, separate_products);
+}
+
+template <bool FusedUnaryMul>
+static void ggml_cuda_op_moe_shared_combine_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * experts, const ggml_tensor * scale,
         const ggml_tensor * weights, ggml_tensor * routed, ggml_tensor * unary, ggml_tensor * mul, ggml_tensor * add, bool separate_products) {
     mul_add_args binary{};
     const bool product_first = add->src[0] != routed;
@@ -566,8 +582,19 @@ void ggml_cuda_op_moe_shared_combine(ggml_backend_cuda_context & ctx, const ggml
     }
     const dim3 blocks(routed->ne[1], (routed->ne[0] + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE, 1);
     const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
-    ggml_cuda_kernel_launch(moe_shared_combine_kernel, launch, (const float *) experts->data, scale ? (const float *) scale->data : nullptr,
+    const auto kernel = FusedUnaryMul ? moe_shared_combine_unary_mul_kernel : moe_shared_combine_kernel;
+    ggml_cuda_kernel_launch(kernel, launch, (const float *) experts->data, scale ? (const float *) scale->data : nullptr,
         (const float *) weights->data, (float *) routed->data, int(routed->ne[0]), int(experts->ne[1]), binary, input, product_first, separate_products);
+}
+
+void ggml_cuda_op_moe_shared_combine(ggml_backend_cuda_context & ctx, const ggml_tensor * experts, const ggml_tensor * scale,
+        const ggml_tensor * weights, ggml_tensor * routed, ggml_tensor * unary, ggml_tensor * mul, ggml_tensor * add, bool separate_products) {
+    ggml_cuda_op_moe_shared_combine_impl<false>(ctx, experts, scale, weights, routed, unary, mul, add, separate_products);
+}
+
+void ggml_cuda_op_moe_shared_combine_unary_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * experts, const ggml_tensor * scale,
+        const ggml_tensor * weights, ggml_tensor * routed, ggml_tensor * unary, ggml_tensor * mul, ggml_tensor * add, bool separate_products) {
+    ggml_cuda_op_moe_shared_combine_impl<true>(ctx, experts, scale, weights, routed, unary, mul, add, separate_products);
 }
 
 void ggml_cuda_op_repeat_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * repeat, ggml_tensor * mul, ggml_tensor * add) {
