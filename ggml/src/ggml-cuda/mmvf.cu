@@ -4,6 +4,13 @@
 #include "mmvf.cuh"
 #include "convert.cuh"
 
+static bool mmvf_packed_rows_eligible(int64_t ncols, uint64_t nrows, int block_size, uintptr_t alignment, int device_index) {
+    const auto & device = ggml_cuda_info().devices[device_index];
+    return ncols % 4 == 0 && ncols <= block_size && ncols <= INT32_MAX - block_size && nrows <= INT32_MAX &&
+        GGML_CUDA_CC_IS_NVIDIA(device.cc) && device.cc >= GGML_CUDA_CC_AMPERE && device.warp_size == 32 &&
+        device.nsm > 0 && (nrows + 3)/4 >= uint64_t(4)*device.nsm && (alignment & 15) == 0;
+}
+
 template <typename T, typename Acc, int Block, bool LaunchComplete = true>
 static __device__ __forceinline__ float mmvf_packed_dot(const T * x, const float * y, int ncols2, bool valid) {
     constexpr int packs = (Block + 127)/128;
@@ -573,13 +580,10 @@ static void mul_mat_vec_f_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     if constexpr (ncols_dst == 1 && !is_multi_token_id && block_size >= 128 && ggml_cuda_get_physical_warp_size() == 32) {
-        const auto & device = ggml_cuda_info().devices[ggml_cuda_get_device()];
         const uintptr_t alignment = reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(y) |
             size_t(stride_row)*sizeof(T) | size_t(stride_channel_x)*sizeof(T) | size_t(stride_sample_x)*sizeof(T) |
             size_t(stride_channel_y)*sizeof(float) | size_t(stride_sample_y)*sizeof(float);
-        if (!ids && ncols % 4 == 0 && ncols <= block_size && ncols <= INT32_MAX - block_size && block_nums.x <= INT32_MAX &&
-                GGML_CUDA_CC_IS_NVIDIA(device.cc) && device.cc >= GGML_CUDA_CC_AMPERE && device.warp_size == 32 &&
-                device.nsm > 0 && (uint64_t(block_nums.x) + 3)/4 >= uint64_t(4)*device.nsm && (alignment & 15) == 0) {
+        if (!ids && mmvf_packed_rows_eligible(ncols, block_nums.x, block_size, alignment, ggml_cuda_get_device())) {
             const ggml_cuda_kernel_launch_params packed_params = {
                 dim3((uint64_t(block_nums.x) + 3)/4, block_nums.y, block_nums.z), dim3(32, 4, 1), 0, stream};
             ggml_cuda_kernel_launch(mul_mat_vec_f_packed_rows<T, type_acc, block_size>, packed_params,
@@ -1154,6 +1158,34 @@ struct ggml_cuda_mmvf_pair_operand {
     int stride_sample_output;
 };
 
+template <typename T, typename Acc, int Block, bool Postop>
+static __global__ void mul_mat_vec_f_pair_packed_rows(
+        ggml_cuda_mmvf_pair_operand first, ggml_cuda_mmvf_pair_operand second, const float * input,
+        int first_rows, int nrows, int k2, uint3 channel_ratio, uint3 sample_ratio, int stride_channel_input, int stride_sample_input,
+        ggml_cuda_mmvf_postop_store first_write, ggml_cuda_mmvf_postop_store second_write) {
+    const uint32_t index = blockIdx.x*4 + threadIdx.y;
+    const bool valid = index < uint32_t(nrows);
+    const bool use_first = index < uint32_t(first_rows);
+    const int row = valid ? int(index - (use_first ? 0U : uint32_t(first_rows))) : 0;
+    const auto operand = use_first ? first : second;
+    const uint32_t channel = blockIdx.y, sample = blockIdx.z;
+    const uint32_t channel_x = fastdiv(channel, channel_ratio), sample_x = fastdiv(sample, sample_ratio);
+    const T * weight = (const T *) operand.weight + int64_t(sample_x)*operand.stride_sample_weight +
+        int64_t(channel_x)*operand.stride_channel_weight + int64_t(row)*operand.stride_row;
+    const float * y = input + int64_t(sample)*stride_sample_input + int64_t(channel)*stride_channel_input;
+    float * dst = operand.output + int64_t(sample)*operand.stride_sample_output + int64_t(channel)*operand.stride_channel_output;
+    ggml_cuda_pdl_sync();
+    const float value = mmvf_packed_dot<T, Acc, Block>(weight, y, k2, valid);
+    if (valid && threadIdx.x == 0) {
+        if constexpr (Postop) {
+            const auto write = use_first ? first_write : second_write;
+            write(dst, operand.output, row, value);
+        } else {
+            dst[row] = value;
+        }
+    }
+}
+
 template <typename T, typename Acc, int Block>
 static __global__ void mul_mat_vec_f_pair(
         ggml_cuda_mmvf_pair_operand first, ggml_cuda_mmvf_pair_operand second, const float * input,
@@ -1192,6 +1224,23 @@ static void ggml_cuda_mmvf_pair_launch(ggml_backend_cuda_context & ctx, const gg
         return ggml_cuda_mmvf_pair_operand{weight->data, (float *) mm->data, int(weight->nb[1]/sizeof(T)),
             int(weight->nb[2]/sizeof(T)), int(weight->nb[3]/sizeof(T)), int(mm->nb[2]/sizeof(float)), int(mm->nb[3]/sizeof(float))};
     };
+    if constexpr (Block >= 128 && ggml_cuda_get_physical_warp_size() == 32) {
+        uintptr_t alignment = reinterpret_cast<uintptr_t>(input->data) | input->nb[2] | input->nb[3];
+        for (const ggml_tensor * mm : {first, second}) {
+            const ggml_tensor * weight = mm->src[0];
+            alignment |= reinterpret_cast<uintptr_t>(weight->data) | weight->nb[1] | weight->nb[2] | weight->nb[3];
+        }
+        const uint64_t nrows = uint64_t(first->ne[0]) + second->ne[0];
+        if (mmvf_packed_rows_eligible(input->ne[0]/2, nrows, Block, alignment, ctx.device)) {
+            const ggml_cuda_kernel_launch_params packed_params = {
+                dim3((nrows + 3)/4, first->ne[2], first->ne[3]), dim3(32, 4, 1), 0, ctx.stream()};
+            ggml_cuda_kernel_launch(mul_mat_vec_f_pair_packed_rows<T, Acc, Block, Postop>, packed_params, operand(first), operand(second),
+                (const float *) input->data, int(first->ne[0]), int(nrows), int(input->ne[0]/2),
+                init_fastdiv_values(first->ne[2]/first->src[0]->ne[2]), init_fastdiv_values(first->ne[3]/first->src[0]->ne[3]),
+                int(input->nb[2]/sizeof(float)), int(input->nb[3]/sizeof(float)), ggml_cuda_mmvf_postop_args(first_ops), ggml_cuda_mmvf_postop_args(second_ops));
+            return;
+        }
+    }
     const ggml_cuda_kernel_launch_params params = {
         dim3(first->ne[0] + second->ne[0], first->ne[2], first->ne[3]), dim3(Block, 1, 1),
         int(ggml_cuda_info().devices[ctx.device].warp_size*sizeof(float)), ctx.stream()};

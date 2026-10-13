@@ -4030,6 +4030,15 @@ struct ggml_cuda_mmvf_pair_plan {
     }
 };
 
+static bool ggml_cuda_mmvf_pair_compatible_precision(const ggml_tensor * first, const ggml_tensor * second, int device) {
+    if (first->op_params[0] == second->op_params[0]) { return true; }
+    ggml_cuda_mmvf_pair_policy first_policy, second_policy;
+    if (!ggml_cuda_mmvf_pair_compute_policy(first, device, first_policy) ||
+            !ggml_cuda_mmvf_pair_compute_policy(second, device, second_policy)) { return false; }
+    return first->ne[1] > 1 || (first_policy.round_input == second_policy.round_input && first_policy.half_acc == second_policy.half_acc &&
+        first_policy.half_output == second_policy.half_output);
+}
+
 static int ggml_cuda_match_mmvf_pair(ggml_cgraph * graph, int i, int device, const ggml_cuda_mmvf_pair_plan & plan, bool allocated = true) {
     ggml_tensor * first = graph->nodes[i];
     if (first->op != GGML_OP_MUL_MAT) { return -1; }
@@ -4046,7 +4055,7 @@ static int ggml_cuda_match_mmvf_pair(ggml_cgraph * graph, int i, int device, con
         ggml_tensor * second = graph->nodes[j];
         if (second->op != GGML_OP_MUL_MAT || second->src[1] != first->src[1] ||
                 !ggml_cuda_mmvf_pair_node(second, device, allocated) || !ready(second->src[0]) ||
-                first->src[0]->type != second->src[0]->type || first->op_params[0] != second->op_params[0] ||
+                first->src[0]->type != second->src[0]->type || !ggml_cuda_mmvf_pair_compatible_precision(first, second, device) ||
                 first->ne[0] > INT_MAX - second->ne[0]) { continue; }
         bool same_batch = true;
         for (int d = 2; d < GGML_MAX_DIMS; ++d) {
