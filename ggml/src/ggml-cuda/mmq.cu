@@ -455,7 +455,7 @@ bool ggml_cuda_should_fuse_mmq_id(const ggml_tensor * up, const ggml_tensor * ga
     return tiles_i <= max_tiles/tiles_j/experts;
 }
 
-void ggml_cuda_mul_mat_id_q_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * dst, const ggml_cuda_mmq_id_input * prepared) {
+void ggml_cuda_mul_mat_id_q_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * dst, const ggml_cuda_mmq_id_input * prepared, const ggml_cuda_mmq_id_output * output) {
     const ggml_tensor * src0 = up->src[0];
     const ggml_tensor * src1 = up->src[1];
     const ggml_tensor * ids  = up->src[2];
@@ -514,18 +514,36 @@ void ggml_cuda_mul_mat_id_q_pair(ggml_backend_cuda_context & ctx, const ggml_ten
     ggml_tensor glu_view = *dst;
     glu_view.src[0] = &gate_view;
     glu_view.src[1] = &up_view;
-    switch (ggml_get_glu_op(dst)) {
-        case GGML_GLU_OP_SWIGLU:       ggml_cuda_op_swiglu(ctx, &glu_view); break;
-        case GGML_GLU_OP_GEGLU:        ggml_cuda_op_geglu(ctx, &glu_view); break;
-        case GGML_GLU_OP_REGLU:        ggml_cuda_op_reglu(ctx, &glu_view); break;
-        case GGML_GLU_OP_SWIGLU_CLAMP: ggml_cuda_op_swiglu_clamp(ctx, &glu_view); break;
-        default:                      GGML_ABORT("unsupported paired MMQ GLU");
+    if (output) {
+        GGML_ASSERT(output->dst == dst && output->layout >= 0 && output->layout <= 3);
+        auto & routes = *output->routes;
+        auto & image = *output->image;
+        if (!routes.ids_src1.get()) {
+            ggml_cuda_prepare_mmq_id_routes(ctx, output->reader, routes, MMQ_ID_INPUT_GUARD, true);
+        }
+        image.routes = &routes;
+        image.quantized.alloc(output->size);
+        const int32_t * inverse = routes.inverse.get() ? routes.inverse.get() : routes.ids_src1.get();
+        ggml_cuda_op_glu_mmq_id(ctx, &glu_view, output->reader->src[1], int(output->reader->src[2]->ne[0]),
+            inverse, image.quantized.get(), output->layout);
+    } else {
+        switch (ggml_get_glu_op(dst)) {
+            case GGML_GLU_OP_SWIGLU:       ggml_cuda_op_swiglu(ctx, &glu_view); break;
+            case GGML_GLU_OP_GEGLU:        ggml_cuda_op_geglu(ctx, &glu_view); break;
+            case GGML_GLU_OP_REGLU:        ggml_cuda_op_reglu(ctx, &glu_view); break;
+            case GGML_GLU_OP_SWIGLU_CLAMP: ggml_cuda_op_swiglu_clamp(ctx, &glu_view); break;
+            default:                      GGML_ABORT("unsupported paired MMQ GLU");
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
+void ggml_cuda_mul_mat_id_q_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * dst, const ggml_cuda_mmq_id_input * prepared) {
+    ggml_cuda_mul_mat_id_q_pair(ctx, up, gate, dst, prepared, nullptr);
+}
+
 void ggml_cuda_mul_mat_id_q_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * dst) {
-    ggml_cuda_mul_mat_id_q_pair(ctx, up, gate, dst, nullptr);
+    ggml_cuda_mul_mat_id_q_pair(ctx, up, gate, dst, nullptr, nullptr);
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {

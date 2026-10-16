@@ -1685,5 +1685,15 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 
 bool ggml_cuda_should_fuse_mmq_id(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu, int cc, size_t smpbo);
 
+struct ggml_cuda_mmq_id_output {
+    const ggml_tensor * dst;
+    const ggml_tensor * reader;
+    ggml_cuda_mmq_id_input * routes;
+    ggml_cuda_mmq_id_input * image;
+    size_t size;
+    int layout;
+};
+
 void ggml_cuda_mul_mat_id_q_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * dst);
 void ggml_cuda_mul_mat_id_q_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * dst, const ggml_cuda_mmq_id_input * prepared);
+void ggml_cuda_mul_mat_id_q_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * dst, const ggml_cuda_mmq_id_input * prepared, const ggml_cuda_mmq_id_output * output);
